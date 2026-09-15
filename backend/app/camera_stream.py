@@ -10,6 +10,7 @@ import time
 import cv2
 
 from . import camera_db, config
+from .face_pipeline import get_pipeline
 
 log = logging.getLogger("camera_stream")
 
@@ -35,6 +36,8 @@ class CameraStream:
         self._subscribers: set = set()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._face_pipeline = None
+        self._face_pipeline_failed = False
 
     def subscribe(self, queue) -> None:
         with self._lock:
@@ -77,6 +80,25 @@ class CameraStream:
                     cap = None
                     time.sleep(2)
                     continue
+
+                # Face detection/tracking/recognition, fed off the same
+                # frame the live view already reads — no second RTSP
+                # connection. Deliberately isolated with its own try/except:
+                # a missing model file or any other pipeline error must
+                # never take down the live video broadcast below, so on
+                # first failure it logs once and stays off for the rest of
+                # this stream's lifetime instead of retrying every frame.
+                if not self._face_pipeline_failed:
+                    try:
+                        if self._face_pipeline is None:
+                            self._face_pipeline = get_pipeline(self.camera_id)
+                        self._face_pipeline.feed_frame(frame)
+                    except Exception:
+                        log.exception(
+                            "camera %s: face pipeline failed, disabling face recognition for this stream",
+                            self.camera_id,
+                        )
+                        self._face_pipeline_failed = True
 
                 ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:

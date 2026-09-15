@@ -1,0 +1,7 @@
+# Model checkpoints are large binaries fetched manually (see
+# FACE_RECOGNITION_WIRING.md) — never auto-downloaded, never committed.
+models/*.pt
+models/*.onnx
+
+__pycache__/
+*.pyc

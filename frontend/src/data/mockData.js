@@ -119,9 +119,3 @@ export const intrusionZones = [
   { zone: "Reception Area", access: 24, action: "Give Access" },
   { zone: "Canteen Area", access: 60, action: "Give Access" },
 ];
-
-export const intrusionAccessList = [
-  { name: "Aarti Prajapati", activeWindow: "Always", enabled: true },
-  { name: "Aarti Prajapati", activeWindow: "Always", enabled: true },
-  { name: "Aarti Prajapati", activeWindow: "Always", enabled: true },
-];

@@ -1,8 +1,6 @@
 // ---------------------------------------------------------------------------
-// Extra mock data for the Intrusion page & its zone-detail view — richer
-// than mockData.js's generic `intrusionAccessList` (which is the same 3
-// rows for every zone). Keyed by zone name so it can be looked up from
-// mockData.js's `intrusionZones`.
+// Extra mock data for the Intrusion page & its zone-detail view. Keyed by
+// zone name so it can be looked up from mockData.js's `intrusionZones`.
 // ---------------------------------------------------------------------------
 
 export const weeklyUnauthorized = [

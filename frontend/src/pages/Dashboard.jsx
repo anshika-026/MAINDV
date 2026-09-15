@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, ShieldAlert, Sparkles } from "lucide-react";
+import { AlertTriangle, Sparkles } from "lucide-react";
 import * as api from "../api/client";
 import StatCard from "../components/StatCard";
 import { useAuth } from "../context/AuthContext";

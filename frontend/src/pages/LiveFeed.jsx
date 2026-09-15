@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Eye, ShieldAlert, UserCheck, Scale, ChevronRight, Radio } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import LiveCameraTile from "../components/LiveCameraTile";
+import CameraViewerModal from "../components/CameraViewerModal";
 import * as api from "../api/client";
 
 const TABS = [
@@ -13,6 +14,7 @@ export default function LiveFeed() {
   const [cameras, setCameras] = useState([]);
   const [tab, setTab] = useState("all");
   const [activeInsight, setActiveInsight] = useState("unsupervised");
+  const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
     api.getCameras().then(setCameras);
@@ -113,12 +115,14 @@ export default function LiveFeed() {
           ) : (
             <div className="grid sm:grid-cols-2 xl:grid-cols-3 gap-4">
               {visible.map((cam) => (
-                <LiveCameraTile key={cam.id} camera={cam} />
+                <LiveCameraTile key={cam.id} camera={cam} onClick={() => setExpanded(cam)} />
               ))}
             </div>
           )}
         </div>
       </div>
+
+      <CameraViewerModal camera={expanded} onClose={() => setExpanded(null)} />
     </div>
   );
 }

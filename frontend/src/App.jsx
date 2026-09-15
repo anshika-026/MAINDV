@@ -15,6 +15,7 @@ import Footfall from "./pages/Footfall";
 import Intrusion from "./pages/Intrusion";
 import CameraManagement from "./pages/CameraManagement";
 import SiteManagement from "./pages/SiteManagement";
+import FaceTraining from "./pages/FaceTraining";
 
 import SettingsLayout from "./pages/settings/SettingsLayout";
 import Profile from "./pages/settings/Profile";
@@ -29,6 +30,14 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/signup" element={<Signup />} />
+          <Route
+            path="/face-training"
+            element={
+              <ProtectedRoute>
+                <FaceTraining />
+              </ProtectedRoute>
+            }
+          />
 
           <Route
             element={

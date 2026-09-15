@@ -18,7 +18,7 @@ export default function Login() {
     try {
       await login(email, password);
       navigate("/dashboard");
-    } catch (err) {
+    } catch {
       setError("Couldn't log in. Check your email and password and try again.");
     } finally {
       setLoading(false);

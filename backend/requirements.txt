@@ -3,3 +3,20 @@ uvicorn[standard]==0.53.0
 opencv-python==5.0.0.93
 pydantic==2.13.5
 python-dotenv==1.1.1
+
+# Face recognition (detection + tracking + embedding) — see
+# FACE_RECOGNITION_WIRING.md for the manual bootstrap steps (weight file,
+# gallery enrollment) this alone doesn't cover.
+ultralytics==8.4.151
+insightface==2.0
+onnxruntime==1.30.0
+# onnxruntime-gpu instead, if this ever runs on a box with CUDA available
+supervision==0.30.3
+# Provides supervision's ByteTrack — used instead of the `yolox` package,
+# which requires cmake/a C++ toolchain to build and failed on this machine.
+
+# Manual-labeling dataset + classifier training pipeline — see
+# FACE_TRAINING.md. scikit-learn trains a classifier on frozen ArcFace
+# embeddings (Option B); joblib (de)serializes it to/from disk.
+scikit-learn==1.9.1
+joblib==1.6.0

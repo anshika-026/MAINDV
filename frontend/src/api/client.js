@@ -14,7 +14,7 @@
 import * as mock from "../data/mockData";
 
 // Set this in a .env file as VITE_API_BASE_URL=https://your-api.example.com/api
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
+export const BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 
 // Derived for the live-view websocket (camera_stream.py) — same host as
 // BASE_URL, minus the /api suffix and http(s) swapped for ws(s).
@@ -77,11 +77,6 @@ export async function resolveAlert(id, reason) {
   // return request(`/alerts/${id}/resolve`, { method: "POST", body: JSON.stringify({ reason }) });
   return Promise.resolve({ ok: true });
 }
-export async function acknowledgeAlert(id) {
-  // return request(`/alerts/${id}/acknowledge`, { method: "POST" });
-  return Promise.resolve({ ok: true });
-}
-
 // ---- Cameras / Sites -----------------------------------------------------
 function mapCamera(c) {
   return {
@@ -126,19 +121,32 @@ export async function addSite(payload) {
 }
 
 // ---- People ----------------------------------------------------------
+// Real enrolled-face data lives on the separately deployed face-enrollment
+// service (not this repo's backend) — /api/faces returns each enrolled
+// person's name, unique employee ID and reference sample photos.
+const FACES_API_BASE = "http://13.61.58.14";
+
 export async function getPeople() {
-  // return request("/people");
-  return Promise.resolve(mock.people);
+  try {
+    const res = await fetch(`${FACES_API_BASE}/api/faces`);
+    if (!res.ok) throw new Error(`Faces API error ${res.status}`);
+    const rows = await res.json();
+    return rows.map((r) => ({
+      name: r.name,
+      employeeId: r.employee_id || "-",
+      designs: r.sample_count,
+      faceEnrolled: r.sample_count > 0,
+      enrollment: r.sample_count > 0 ? "Enrolled" : "Not enrolled",
+      photos: (r.photo_urls || []).map((path, i) => ({ id: `${r.name}-${i}`, url: `${FACES_API_BASE}${path}` })),
+    }));
+  } catch {
+    return mock.people;
+  }
 }
 export async function getValidatedPeople() {
   // return request("/people/validated");
   return Promise.resolve(mock.validatedPeople);
 }
-export async function addPerson(payload) {
-  // return request("/people", { method: "POST", body: JSON.stringify(payload) });
-  return Promise.resolve({ ok: true });
-}
-
 // ---- Attendance --------------------------------------------------------
 export async function getAttendance() {
   // return request("/attendance");
@@ -148,11 +156,6 @@ export async function getAttendanceStats() {
   // return request("/attendance/stats");
   return Promise.resolve(mock.attendanceStats);
 }
-export async function markLeave(employeeId, payload) {
-  // return request(`/attendance/${employeeId}/leave`, { method: "POST", body: JSON.stringify(payload) });
-  return Promise.resolve({ ok: true });
-}
-
 // ---- Workforce -----------------------------------------------------------
 export async function getWorkforceStats() {
   // return request("/workforce/stats");
@@ -182,10 +185,6 @@ export async function getIntrusionZones() {
   // return request("/intrusion/zones");
   return Promise.resolve(mock.intrusionZones);
 }
-export async function getZoneAccessList(zoneName) {
-  // return request(`/intrusion/zones/${encodeURIComponent(zoneName)}/access`);
-  return Promise.resolve(mock.intrusionAccessList);
-}
 export async function addZone(payload) {
   // return request("/intrusion/zones", { method: "POST", body: JSON.stringify(payload) });
   return Promise.resolve({ ok: true });
@@ -199,4 +198,40 @@ export async function getProfile() {
 export async function updateProfile(payload) {
   // return request("/me", { method: "PATCH", body: JSON.stringify(payload) });
   return Promise.resolve({ ok: true });
+}
+
+// ---- Face training (manual labeling + classifier training) ---------------
+// Real backend, unlike most of this file — see backend/FACE_TRAINING.md.
+// Errors surface FastAPI's `detail` message directly (e.g. "Unknown
+// employee_id '999'") instead of request()'s generic wrapped text, since
+// the labeling page shows this string straight to the person typing IDs.
+async function trainingRequest(path, options = {}) {
+  const res = await fetch(`${BASE_URL}/faces/training${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export function getNextTrainingCapture() {
+  return trainingRequest("/next");
+}
+export function getTrainingStats() {
+  return trainingRequest("/stats");
+}
+export function trainingImageUrl(captureId) {
+  return `${BASE_URL}/faces/training/image/${captureId}`;
+}
+export function labelTrainingCapture(captureId, employeeId) {
+  return trainingRequest("/label", {
+    method: "POST",
+    body: JSON.stringify({ capture_id: captureId, employee_id: employeeId }),
+  });
+}
+export function skipTrainingCapture(captureId) {
+  return trainingRequest("/skip", { method: "POST", body: JSON.stringify({ capture_id: captureId }) });
 }

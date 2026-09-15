@@ -1,12 +1,12 @@
 import asyncio
 import logging
-import time
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import camera_db, camera_stream, config
+from . import camera_db, camera_stream, config, face_db
+from . import face_routes, face_training_routes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,10 +20,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(face_routes.router)
+app.include_router(face_training_routes.router)
+
 
 @app.on_event("startup")
 def on_startup():
     camera_db.init_db()
+    face_db.init_face_tables()
 
 
 # ---------------------------------------------------------------------------
