@@ -13,6 +13,10 @@ Raw sqlite3 storage for:
     match confidence — the bulk dataset for the manual labeling UI + the
     classifier training pipeline. Deliberately separate from face_pending,
     which only ever sees low-confidence captures.
+  - collection_sessions: persistent state for a multi-day background
+    collection run (start/end time, which cameras, status, activity) so a
+    backend restart can detect and resume an unfinished session instead of
+    silently losing it. See FACE_TRAINING.md "7-day collection sessions".
 
 Matches the style of camera_db.py — no ORM, CREATE TABLE IF NOT EXISTS,
 module-level connection helper.
@@ -20,10 +24,18 @@ module-level connection helper.
 
 import sqlite3
 import json
+import threading
 import time
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+
+# Guards the "count all captures, then insert" sequence in
+# face_pipeline.py's _save_training_capture() so MAX_TRAINING_CAPTURES can
+# never be exceeded even though multiple camera threads write concurrently.
+# One process, one lock — sufficient here since this app runs as a single
+# uvicorn worker (see BACKEND_HANDOFF.md), not multiple processes.
+capture_limit_lock = threading.Lock()
 
 
 def get_conn():
@@ -80,6 +92,23 @@ def init_face_tables():
         )
     """)
 
+    # The People page's roster (name, photos, enrollment) is read live from a
+    # separate external service (see face_routes.py/client.js) that this app
+    # has no write access to — there's no update API for it. Its employee_id
+    # field is frequently null/stale, and the People page's own "Save" button
+    # previously only updated in-memory React state (never persisted
+    # anywhere), so an edited ID reverted on the next refresh. This table is
+    # the actual persistence for that ID field: keyed by the external
+    # service's name string (the only stable shared identifier available),
+    # it overrides whatever employee_id that service reports.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS people_employee_id_overrides (
+            name TEXT PRIMARY KEY,
+            employee_id TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS face_training_captures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,13 +121,38 @@ def init_face_tables():
             blur_score REAL,                 -- variance of Laplacian; higher = sharper
             brightness REAL,                 -- mean grayscale intensity, 0-255
             employee_id TEXT,                -- nullable until labeled
-            label_status TEXT NOT NULL DEFAULT 'unlabeled',  -- unlabeled | labeled | skipped
+            -- unlabeled | labeled | skipped: normal, human-facing queue states.
+            -- no_embedding | rejected: never shown in /face-training, never
+            -- trainable — set at insert time by face_pipeline.py, see
+            -- FACE_TRAINING.md's "Quality filtering & capture statuses".
+            label_status TEXT NOT NULL DEFAULT 'unlabeled',
             labeled_at REAL
         )
     """)
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_training_captures_status
         ON face_training_captures(label_status, captured_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_training_captures_camera
+        ON face_training_captures(camera_id)
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS collection_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at REAL NOT NULL,
+            planned_end_at REAL NOT NULL,
+            camera_ids TEXT NOT NULL,        -- JSON list[int]
+            status TEXT NOT NULL DEFAULT 'running',  -- running | completed | stopped
+            last_activity_at REAL,
+            duplicates_rejected INTEGER NOT NULL DEFAULT 0,
+            completed_at REAL
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_collection_sessions_status
+        ON collection_sessions(status)
     """)
 
     conn.commit()
@@ -266,6 +320,62 @@ def list_employees() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def set_person_employee_id(name: str, employee_id: str) -> None:
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO people_employee_id_overrides (name, employee_id, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET employee_id = excluded.employee_id, updated_at = excluded.updated_at""",
+        (name, employee_id, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_person_employee_id_overrides() -> dict[str, str]:
+    conn = get_conn()
+    rows = conn.execute("SELECT name, employee_id FROM people_employee_id_overrides").fetchall()
+    conn.close()
+    return {r["name"]: r["employee_id"] for r in rows}
+
+
+def delete_employees_not_in(employee_ids: set[str]) -> int:
+    """Removes local roster rows whose ID is no longer returned by the
+    external face-enrollment service — otherwise a renamed/renumbered ID
+    (e.g. 018 -> 118 for the same person) would leave the old ID stuck in
+    the datalist/validation forever, since upsert_employee only ever adds or
+    updates, never removes. Safe to call: this table is just a local mirror
+    for validating labels server-side (see the module docstring), not the
+    source of truth, and it has no foreign key into face_training_captures —
+    a capture already labeled under a since-removed ID keeps that label
+    untouched, this only prunes the roster used for *new* labels.
+
+    Caller's responsibility: pass an empty set only when that's genuinely
+    correct (the external service really has zero IDs) — this will delete
+    every local row in that case. sync_employees() in face_training_routes.py
+    guards against calling this with an accidentally-empty set from a
+    malformed/partial API response."""
+    conn = get_conn()
+    if not employee_ids:
+        n = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()["c"]
+        conn.execute("DELETE FROM employees")
+    else:
+        placeholders = ",".join("?" * len(employee_ids))
+        rows = conn.execute(
+            f"SELECT employee_id FROM employees WHERE employee_id NOT IN ({placeholders})",
+            tuple(employee_ids),
+        ).fetchall()
+        n = len(rows)
+        if n:
+            conn.execute(
+                f"DELETE FROM employees WHERE employee_id NOT IN ({placeholders})",
+                tuple(employee_ids),
+            )
+    conn.commit()
+    conn.close()
+    return n
+
+
 def count_employees() -> int:
     conn = get_conn()
     n = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()["c"]
@@ -285,13 +395,18 @@ def add_training_capture(
     detection_confidence: float | None = None,
     blur_score: float | None = None,
     brightness: float | None = None,
+    label_status: str = "unlabeled",
 ) -> int:
+    """`label_status` defaults to 'unlabeled' (the normal case) but
+    face_pipeline.py passes 'no_embedding' or 'rejected' for captures that
+    should never reach the labeling queue — see the label_status comment on
+    the table definition above."""
     conn = get_conn()
     cur = conn.execute(
         """INSERT INTO face_training_captures
            (camera_id, track_id, captured_at, image_path, embedding,
             detection_confidence, blur_score, brightness, label_status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unlabeled')""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             camera_id,
             track_id,
@@ -301,12 +416,35 @@ def add_training_capture(
             detection_confidence,
             blur_score,
             brightness,
+            label_status,
         ),
     )
     conn.commit()
     new_id = cur.lastrowid
     conn.close()
     return new_id
+
+
+def count_training_captures() -> int:
+    """Total across ALL cameras and ALL statuses — the number
+    MAX_TRAINING_CAPTURES is checked against. Must be called while holding
+    capture_limit_lock when used as part of the insert-or-reject decision."""
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) AS c FROM face_training_captures").fetchone()["c"]
+    conn.close()
+    return n
+
+
+def get_capture_counts_by_status() -> dict:
+    """Diagnostic breakdown, e.g. {"unlabeled": 12, "labeled": 3, "skipped": 1,
+    "no_embedding": 8, "rejected": 2}. Used for verification/reporting, not
+    by the labeling UI itself."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT label_status, COUNT(*) AS c FROM face_training_captures GROUP BY label_status"
+    ).fetchall()
+    conn.close()
+    return {r["label_status"]: r["c"] for r in rows}
 
 
 def get_training_capture(capture_id: int) -> dict | None:
@@ -333,13 +471,27 @@ def get_next_unlabeled_capture() -> dict | None:
 
 
 def get_training_stats() -> dict:
+    """`reviewed`/`total` are scoped to the human-facing queue only
+    ('unlabeled'/'labeled'/'skipped') — 'no_embedding' and 'rejected'
+    captures were never shown to a human, so counting them here would
+    inflate the /face-training "X / Y reviewed" counter with captures
+    nobody actually reviewed. `all_captures`/`by_status` cover everything,
+    for diagnostics."""
     conn = get_conn()
-    total = conn.execute("SELECT COUNT(*) AS c FROM face_training_captures").fetchone()["c"]
-    reviewed = conn.execute(
-        "SELECT COUNT(*) AS c FROM face_training_captures WHERE label_status != 'unlabeled'"
+    total = conn.execute(
+        "SELECT COUNT(*) AS c FROM face_training_captures WHERE label_status IN ('unlabeled','labeled','skipped')"
     ).fetchone()["c"]
+    reviewed = conn.execute(
+        "SELECT COUNT(*) AS c FROM face_training_captures WHERE label_status IN ('labeled','skipped')"
+    ).fetchone()["c"]
+    all_captures = conn.execute("SELECT COUNT(*) AS c FROM face_training_captures").fetchone()["c"]
     conn.close()
-    return {"reviewed": reviewed, "total": total}
+    return {
+        "reviewed": reviewed,
+        "total": total,
+        "all_captures": all_captures,
+        "by_status": get_capture_counts_by_status(),
+    }
 
 
 def label_training_capture(capture_id: int, employee_id: str, new_image_path: str) -> None:
@@ -372,6 +524,66 @@ def label_training_capture(capture_id: int, employee_id: str, new_image_path: st
         conn.close()
 
 
+def relabel_training_capture(capture_id: int, employee_id: str, new_image_path: str) -> dict:
+    """Corrects an already-labeled or skipped capture to a different
+    employee_id — the undo/fix for a mistyped ID. Same file-then-DB contract
+    as label_training_capture: the caller (face_training_routes.py) has
+    already moved the file to new_image_path before calling this. Returns
+    the row as it was BEFORE the update, so the caller (which already did
+    the move) can react if this raises."""
+    conn = get_conn()
+    try:
+        cur = conn.execute("SELECT * FROM face_training_captures WHERE id = ?", (capture_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"No training capture with id={capture_id}")
+        if row["label_status"] not in ("labeled", "skipped"):
+            raise ValueError(
+                f"Capture {capture_id} is {row['label_status']} — only a labeled or skipped capture can be corrected"
+            )
+        conn.execute(
+            """UPDATE face_training_captures
+               SET label_status = 'labeled', employee_id = ?, labeled_at = ?, image_path = ?
+               WHERE id = ?""",
+            (employee_id, time.time(), new_image_path, capture_id),
+        )
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def unlabel_training_capture(capture_id: int, new_image_path: str) -> dict:
+    """Reverts a labeled/skipped capture back to 'unlabeled' so it re-enters
+    the queue for someone to redo — plain undo, no employee_id guessed.
+    Same file-then-DB contract as label_training_capture. Returns the row as
+    it was BEFORE the update."""
+    conn = get_conn()
+    try:
+        cur = conn.execute("SELECT * FROM face_training_captures WHERE id = ?", (capture_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"No training capture with id={capture_id}")
+        if row["label_status"] not in ("labeled", "skipped"):
+            raise ValueError(f"Capture {capture_id} is {row['label_status']} — nothing to undo")
+        conn.execute(
+            """UPDATE face_training_captures
+               SET label_status = 'unlabeled', employee_id = NULL, labeled_at = NULL, image_path = ?
+               WHERE id = ?""",
+            (new_image_path, capture_id),
+        )
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def skip_training_capture(capture_id: int) -> None:
     conn = get_conn()
     try:
@@ -393,14 +605,177 @@ def skip_training_capture(capture_id: int) -> None:
         conn.close()
 
 
+def get_recent_labeled_captures(limit: int = 8) -> list[dict]:
+    """Newest-first labeled captures, for the labeling page's correction
+    list (see /recent-labels) — lets someone fix a just-typed wrong ID
+    without hunting through the dataset."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT * FROM face_training_captures
+           WHERE label_status = 'labeled'
+           ORDER BY labeled_at DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_labeled_training_embeddings() -> list[dict]:
     """Camera-derived, human-labeled embeddings only — the actual training
     set for the classifier. Distinct from get_all_embeddings(), which is the
-    live-recognition gallery (enrollment photos + assigned review captures)."""
+    live-recognition gallery (enrollment photos + assigned review captures).
+
+    Includes camera_id/track_id (not just person_id/embedding) so a
+    train/validation split can group same-track captures together instead of
+    splitting them across both sides — several captures of one track are
+    near-duplicates of the same appearance, so putting some in train and
+    others in validation would leak information rather than measure
+    generalization. See face_training.py's split logic."""
     conn = get_conn()
     rows = conn.execute(
-        """SELECT employee_id, embedding FROM face_training_captures
+        """SELECT id, employee_id, embedding, camera_id, track_id FROM face_training_captures
            WHERE label_status = 'labeled' AND embedding IS NOT NULL"""
     ).fetchall()
     conn.close()
-    return [{"person_id": r["employee_id"], "embedding": json.loads(r["embedding"])} for r in rows]
+    return [
+        {
+            "capture_id": r["id"],
+            "person_id": r["employee_id"],
+            "embedding": json.loads(r["embedding"]),
+            "camera_id": r["camera_id"],
+            "track_id": r["track_id"],
+        }
+        for r in rows
+    ]
+
+
+def count_training_captures_for_camera(camera_id: int) -> int:
+    """Same atomicity contract as count_training_captures() — call while
+    holding capture_limit_lock when used as part of an insert-or-reject
+    decision (see MAX_CAPTURES_PER_CAMERA in face_pipeline.py)."""
+    conn = get_conn()
+    n = conn.execute(
+        "SELECT COUNT(*) AS c FROM face_training_captures WHERE camera_id = ?", (camera_id,)
+    ).fetchone()["c"]
+    conn.close()
+    return n
+
+
+def get_per_camera_capture_breakdown() -> dict:
+    """{camera_id: {"total":.., "usable":.., "no_embedding":.., "rejected":..,
+    "labeled":.., "skipped":.., "last_capture_at":..}} — for the monitoring
+    endpoint. "usable" means label_status='unlabeled' (awaiting review, has
+    a real embedding, passed quality) to match the wording operators care
+    about, distinct from the DB's internal 'unlabeled' status name."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT camera_id, label_status, COUNT(*) AS c, MAX(captured_at) AS last_at
+           FROM face_training_captures
+           GROUP BY camera_id, label_status"""
+    ).fetchall()
+    conn.close()
+
+    breakdown: dict[int, dict] = {}
+    for r in rows:
+        cam = breakdown.setdefault(
+            r["camera_id"],
+            {"total": 0, "usable": 0, "no_embedding": 0, "rejected": 0,
+             "labeled": 0, "skipped": 0, "last_capture_at": None},
+        )
+        status = r["label_status"]
+        key = "usable" if status == "unlabeled" else status
+        if key in cam:
+            cam[key] = r["c"]
+        cam["total"] += r["c"]
+        if cam["last_capture_at"] is None or (r["last_at"] or 0) > cam["last_capture_at"]:
+            cam["last_capture_at"] = r["last_at"]
+    return breakdown
+
+
+# ---------------------------------------------------------------------------
+# Collection sessions — persistent state for a multi-day background run.
+# ---------------------------------------------------------------------------
+
+def _session_row_to_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["camera_ids"] = json.loads(d["camera_ids"])
+    return d
+
+
+def create_collection_session(started_at: float, planned_end_at: float, camera_ids: list[int]) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO collection_sessions
+           (started_at, planned_end_at, camera_ids, status, last_activity_at)
+           VALUES (?, ?, ?, 'running', ?)""",
+        (started_at, planned_end_at, json.dumps(camera_ids), started_at),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def get_collection_session(session_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM collection_sessions WHERE id = ?", (session_id,)).fetchone()
+    conn.close()
+    return _session_row_to_dict(row) if row else None
+
+
+def get_running_collection_session() -> dict | None:
+    """At most one row should ever be 'running' at a time — enforced by
+    application logic (start_session() reuses/extends it instead of
+    creating a second one), not a DB constraint."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM collection_sessions WHERE status = 'running' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return _session_row_to_dict(row) if row else None
+
+
+def update_collection_session_plan(session_id: int, camera_ids: list[int], planned_end_at: float) -> None:
+    """Extending/reusing an already-running session (e.g. calling
+    /collection/start again with a new camera list or duration) rather than
+    creating a second concurrent 'running' row."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE collection_sessions SET camera_ids = ?, planned_end_at = ? WHERE id = ?",
+        (json.dumps(camera_ids), planned_end_at, session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def touch_running_collection_session() -> None:
+    """Called on every successful capture insert — 'last successful
+    activity' for monitoring/health, independent of label_status."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE collection_sessions SET last_activity_at = ? WHERE status = 'running'",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def increment_running_session_duplicates_rejected() -> None:
+    conn = get_conn()
+    conn.execute(
+        "UPDATE collection_sessions SET duplicates_rejected = duplicates_rejected + 1 WHERE status = 'running'"
+    )
+    conn.commit()
+    conn.close()
+
+
+def finish_collection_session(session_id: int, status: str) -> None:
+    """status: 'completed' (planned end time reached) or 'stopped' (manual)."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE collection_sessions SET status = ?, completed_at = ? WHERE id = ?",
+        (status, time.time(), session_id),
+    )
+    conn.commit()
+    conn.close()

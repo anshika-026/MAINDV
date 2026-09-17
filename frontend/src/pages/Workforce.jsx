@@ -141,7 +141,7 @@ export default function Workforce() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Workforce" />
+      <PageHeader title="Workforce Insights" />
       <Tabs tabs={["Overview", "People Analytics", "Desk Analytics"]} active={tab} onChange={setTab} />
 
       {tab === "Overview" && stats && (

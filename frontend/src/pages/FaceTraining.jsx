@@ -7,13 +7,28 @@ import * as api from "../api/client";
 // navigates around in. See backend/FACE_TRAINING.md for the full pipeline
 // this feeds (camera capture -> label here -> POST /api/faces/training/train).
 export default function FaceTraining() {
-  const [capture, setCapture] = useState(null); // {id, camera_id, camera_name, captured_at} | null
+  const [capture, setCapture] = useState(null); // {id, camera_id, camera_name, captured_at, detection_confidence, ...} | null
   const [reviewed, setReviewed] = useState(0);
   const [total, setTotal] = useState(0);
   const [employeeId, setEmployeeId] = useState("");
+  const [employees, setEmployees] = useState([]); // existing roster, for the datalist — never invented here
+  const [imageUrl, setImageUrl] = useState(null); // object URL for the current capture's image, see loadImage()
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const inputRef = useRef(null);
+
+  // Correction list: recently labeled captures, so a mistyped ID can be
+  // fixed without hunting through the dataset. See /recent-labels.
+  const [recentLabels, setRecentLabels] = useState([]);
+  const [fixingId, setFixingId] = useState(null); // capture id currently being corrected
+  const [fixValue, setFixValue] = useState("");
+  const [recentError, setRecentError] = useState("");
+
+  const loadRecent = useCallback(() => {
+    api.getRecentTrainingLabels(6).then(setRecentLabels).catch(() => {});
+  }, []);
+
+  const [undoNotice, setUndoNotice] = useState("");
 
   const loadNext = useCallback(async () => {
     try {
@@ -34,6 +49,50 @@ export default function FaceTraining() {
   }, [loadNext]);
 
   useEffect(() => {
+    loadRecent();
+  }, [loadRecent]);
+
+  // Deliberately NOT auto-synced from the external face-enrollment service
+  // on every page load. That service's roster turned out to be stale/wrong
+  // (e.g. it still maps ID 018 to a different employee than the real
+  // current roster) — auto-syncing here would silently overwrite a manual
+  // correction the moment this page is reopened. Local roster is the
+  // source of truth for labeling; POST /employees/sync stays available for
+  // an explicit, deliberate re-pull when that external service is actually
+  // up to date again.
+  useEffect(() => {
+    api.getTrainingEmployees().then(setEmployees).catch(() => {});
+  }, []);
+
+  // The image needs its own authenticated fetch (see fetchTrainingImageObjectUrl) —
+  // a plain <img src> can't send the Bearer token this endpoint now requires.
+  // Revoke the previous object URL whenever the capture changes or this page
+  // unmounts, so we don't leak a blob URL per capture over a long session.
+  useEffect(() => {
+    if (!capture) {
+      setImageUrl(null);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl = null;
+    api
+      .fetchTrainingImageObjectUrl(capture.id)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setImageUrl(url);
+      })
+      .catch((e) => setError(e.message));
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [capture]);
+
+  useEffect(() => {
     inputRef.current?.focus();
   }, [capture]);
 
@@ -52,6 +111,7 @@ export default function FaceTraining() {
       await api.labelTrainingCapture(capture.id, employeeId.trim());
       setEmployeeId("");
       loadNext();
+      loadRecent();
     } catch (e2) {
       setError(e2.message);
     }
@@ -75,9 +135,72 @@ export default function FaceTraining() {
     }
   }
 
+  // Undo: sends a just-labeled capture back into the unlabeled queue (its
+  // own captured_at timestamp puts it back at the front, since /next serves
+  // oldest-first) — no employee_id guessed, plain revert.
+  async function handleUndo(id) {
+    setRecentError("");
+    try {
+      await api.unlabelTrainingCapture(id);
+      setRecentLabels((prev) => prev.filter((r) => r.id !== id));
+      setUndoNotice(`Undid label for capture #${id}`);
+      setTimeout(() => setUndoNotice(""), 2500);
+    } catch (e) {
+      setRecentError(e.message);
+    }
+  }
+
+  // Ctrl+Z undoes the MOST RECENT label, regardless of what's focused —
+  // deliberately overrides the browser's native undo (e.g. of in-progress
+  // typing in the Employee ID field), per explicit choice over the
+  // less-aggressive "only when the field is empty" alternative.
+  useEffect(() => {
+    function onKeyDown(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (recentLabels.length > 0) handleUndo(recentLabels[0].id);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [recentLabels]);
+
+  function startFix(row) {
+    setFixingId(row.id);
+    setFixValue(row.employee_id || "");
+    setRecentError("");
+  }
+
+  async function submitFix(id) {
+    if (!fixValue.trim()) return;
+    try {
+      await api.relabelTrainingCapture(id, fixValue.trim());
+      setRecentLabels((prev) => prev.map((r) => (r.id === id ? { ...r, employee_id: fixValue.trim() } : r)));
+      setFixingId(null);
+    } catch (e) {
+      setRecentError(e.message);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-[#0f1016] text-white flex flex-col items-center justify-center px-4 py-10 gap-6">
       <p className="text-xs font-semibold tracking-widest text-slate-400 uppercase">Face dataset labeling</p>
+
+      {/* Existing roster only (see GET /api/faces/training/employees) — a
+          convenience for finding an ID, never a suggestion of who this is.
+          Always rendered (not nested under the capture-present branch) so
+          it's available to the recent-labels "Fix" input too. */}
+      <datalist id="known-employee-ids">
+        {employees.map((e) => (
+          <option key={e.employee_id} value={e.employee_id}>
+            {e.name}
+          </option>
+        ))}
+      </datalist>
+
+      {undoNotice && (
+        <p className="text-xs text-brand-400 bg-brand-500/10 rounded-full px-3 py-1">{undoNotice}</p>
+      )}
 
       {loading ? (
         <p className="text-slate-400 text-sm">Loading…</p>
@@ -93,16 +216,24 @@ export default function FaceTraining() {
       ) : (
         <>
           <div className="w-full max-w-sm rounded-2xl overflow-hidden bg-black border border-white/10">
-            <img
-              src={api.trainingImageUrl(capture.id)}
-              alt="Captured face"
-              className="w-full aspect-square object-cover"
-            />
+            {imageUrl ? (
+              <img src={imageUrl} alt="Captured face" className="w-full aspect-square object-cover" />
+            ) : (
+              <div className="w-full aspect-square flex items-center justify-center text-slate-500 text-sm">
+                Loading image…
+              </div>
+            )}
           </div>
 
           <div className="text-center text-sm text-slate-400">
             <p>Camera: {capture.camera_name}</p>
             <p>Captured: {new Date(capture.captured_at * 1000).toLocaleString()}</p>
+            {typeof capture.detection_confidence === "number" && (
+              <p className="text-xs text-slate-500">
+                Detection confidence: {(capture.detection_confidence * 100).toFixed(0)}%
+                {typeof capture.blur_score === "number" && <> · Sharpness: {Math.round(capture.blur_score)}</>}
+              </p>
+            )}
           </div>
 
           <form onSubmit={handleLabel} className="w-full max-w-xs space-y-2">
@@ -113,17 +244,64 @@ export default function FaceTraining() {
               onChange={(e) => setEmployeeId(e.target.value)}
               onKeyDown={handleKeyDown}
               autoFocus
+              list="known-employee-ids"
+              autoComplete="off"
               className="w-full text-center text-lg rounded-xl border border-white/15 bg-white/5 px-4 py-3 outline-none focus:border-brand-500"
               placeholder="e.g. 018"
             />
             {error && <p className="text-danger-500 text-xs text-center">{error}</p>}
-            <p className="text-xs text-slate-500 text-center">Enter = save + next · Escape = skip</p>
+            <p className="text-xs text-slate-500 text-center">Enter = save + next · Escape = skip · Ctrl+Z = undo last label</p>
           </form>
 
           <p className="text-sm text-slate-400">
             {reviewed} / {total} reviewed
           </p>
         </>
+      )}
+
+      {recentLabels.length > 0 && (
+        <div className="w-full max-w-xs border-t border-white/10 pt-4 mt-2">
+          <p className="text-xs font-medium text-slate-400 text-center mb-2">Just labeled — wrong ID? Fix it here</p>
+          {recentError && <p className="text-danger-500 text-xs text-center mb-2">{recentError}</p>}
+          <ul className="space-y-1.5">
+            {recentLabels.map((r) => (
+              <li key={r.id} className="flex items-center justify-between gap-2 text-xs bg-white/5 rounded-lg px-3 py-2">
+                {fixingId === r.id ? (
+                  <>
+                    <input
+                      autoFocus
+                      value={fixValue}
+                      onChange={(e) => setFixValue(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && submitFix(r.id)}
+                      list="known-employee-ids"
+                      className="flex-1 min-w-0 rounded border border-white/15 bg-white/10 px-2 py-1 text-white outline-none focus:border-brand-500"
+                    />
+                    <button onClick={() => submitFix(r.id)} className="text-brand-400 hover:text-brand-300 shrink-0">
+                      Save
+                    </button>
+                    <button onClick={() => setFixingId(null)} className="text-slate-500 hover:text-slate-300 shrink-0">
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-slate-300 truncate">
+                      <span className="font-semibold text-white">{r.employee_id}</span> · {r.camera_name}
+                    </span>
+                    <span className="flex gap-3 shrink-0">
+                      <button onClick={() => startFix(r)} className="text-brand-400 hover:text-brand-300">
+                        Fix
+                      </button>
+                      <button onClick={() => handleUndo(r.id)} className="text-slate-500 hover:text-slate-300">
+                        Undo
+                      </button>
+                    </span>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );

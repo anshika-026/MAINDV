@@ -1,9 +1,11 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import ProtectedRoute from "./components/ProtectedRoute";
+import AdminRoute from "./components/AdminRoute";
 import AppShell from "./layouts/AppShell";
 
 import Login from "./pages/Login";
+import ClientLogin from "./pages/ClientLogin";
 import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import LiveFeed from "./pages/LiveFeed";
@@ -15,6 +17,7 @@ import Footfall from "./pages/Footfall";
 import Intrusion from "./pages/Intrusion";
 import CameraManagement from "./pages/CameraManagement";
 import SiteManagement from "./pages/SiteManagement";
+import LicenseManagement from "./pages/LicenseManagement";
 import FaceTraining from "./pages/FaceTraining";
 
 import SettingsLayout from "./pages/settings/SettingsLayout";
@@ -29,13 +32,18 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/client-login" element={<ClientLogin />} />
+          {/* Dev-mode equivalent of client-<slug>.decovision.com — see
+              backend/app/license_routes.py's public_company_by_slug and
+              the report's production-deployment notes for real subdomains. */}
+          <Route path="/client/:slug/login" element={<ClientLogin />} />
           <Route path="/signup" element={<Signup />} />
           <Route
             path="/face-training"
             element={
-              <ProtectedRoute>
+              <AdminRoute>
                 <FaceTraining />
-              </ProtectedRoute>
+              </AdminRoute>
             }
           />
 
@@ -54,8 +62,9 @@ export default function App() {
             <Route path="/workforce" element={<Workforce />} />
             <Route path="/footfall" element={<Footfall />} />
             <Route path="/intrusion" element={<Intrusion />} />
-            <Route path="/cameras" element={<CameraManagement />} />
-            <Route path="/sites" element={<SiteManagement />} />
+            <Route path="/cameras" element={<AdminRoute><CameraManagement /></AdminRoute>} />
+            <Route path="/sites" element={<AdminRoute><SiteManagement /></AdminRoute>} />
+            <Route path="/licenses" element={<AdminRoute><LicenseManagement /></AdminRoute>} />
 
             <Route path="/settings" element={<SettingsLayout />}>
               <Route index element={<Navigate to="profile" replace />} />

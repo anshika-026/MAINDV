@@ -14,16 +14,22 @@ Endpoints:
   GET  /api/faces/gallery/{person_id}/count -> how many reference embeddings a person has
 """
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 import os
 import uuid
 from pathlib import Path
 
-from app import face_db
+from app import auth, face_db
 from app.face_pipeline import CameraFacePipeline
 
-router = APIRouter(prefix="/api/faces", tags=["faces"])
+# Admin-only for every route in this router: this is the internal
+# review-queue/enrollment tooling, not something the client portal calls
+# (the client-facing "Identity" page reads from a separate external
+# service — see BACKEND_HANDOFF.md). Previously none of this required
+# any authentication at all, meaning anyone who could reach the backend
+# could assign/ignore review captures or add arbitrary face embeddings.
+router = APIRouter(prefix="/api/faces", tags=["faces"], dependencies=[Depends(auth.require_admin)])
 
 # Resolved relative to this file, not cwd — see the note in face_pipeline.py
 # (_DATA_DIR) for why a plain "backend/data/..." relative default is wrong
@@ -37,6 +43,11 @@ os.makedirs(ENROLL_DIR, exist_ok=True)
 class AssignRequest(BaseModel):
     pending_id: int
     person_id: str
+
+
+class PersonIdOverrideRequest(BaseModel):
+    name: str
+    employee_id: str
 
 
 class IgnoreRequest(BaseModel):
@@ -97,3 +108,21 @@ async def enroll(person_id: str = Form(...), photo: UploadFile = File(...)):
 @router.get("/gallery/{person_id}/count")
 def gallery_count(person_id: str):
     return {"person_id": person_id, "count": face_db.count_embeddings_for_person(person_id)}
+
+
+# ---------------------------------------------------------------------------
+# People-page employee ID overrides — see face_db.py's table comment. The
+# People page's roster itself (name/photos/enrollment) still comes live from
+# the external face-enrollment service; this only persists the employee_id
+# field, since that service has no write API this app can call.
+# ---------------------------------------------------------------------------
+
+@router.get("/people-id-overrides")
+def get_people_id_overrides():
+    return face_db.get_person_employee_id_overrides()
+
+
+@router.post("/people-id-overrides")
+def set_people_id_override(req: PersonIdOverrideRequest):
+    face_db.set_person_employee_id(req.name, req.employee_id)
+    return {"ok": True}

@@ -1,4 +1,5 @@
 import os
+import secrets
 from pathlib import Path
 
 try:
@@ -21,3 +22,13 @@ CORS_ORIGINS = [
 # How often the live-view websocket pushes a JPEG frame, independent of the
 # camera's own frame rate — keeps bandwidth/CPU bounded regardless of source FPS.
 LIVE_STREAM_FPS = float(os.environ.get("LIVE_STREAM_FPS", "8"))
+
+# Used only to sign the license QR payload (license_qr.py) so a
+# photographed/edited QR image can't silently claim a different license key
+# — NOT used for user login/session tokens, since this app has no real
+# auth/JWT session system yet (see BACKEND_HANDOFF.md). Generated once per
+# process if not set explicitly, which is fine for this narrow use (existing
+# QR images just need re-issuing if the process restarts without a fixed
+# secret — set JWT_SECRET in backend/.env for a stable one across restarts).
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"

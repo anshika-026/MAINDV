@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Pencil, Trash2 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
@@ -24,16 +25,28 @@ function healthTone(pct) {
 }
 
 const VIEWS = ["All", "Camera Health"];
+const PURPOSES = ["General", "Theft", "Entry/Exit", "Surveillance", "Safety"];
 
 export default function CameraManagement() {
   const [cameras, setCameras] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState({ code: "", driveName: "", purpose: "", site: "" });
   const [view, setView] = useState("All");
+  const [editing, setEditing] = useState(null);
+  const [toast, setToast] = useState("");
 
   useEffect(() => {
-    api.getCameras().then(setCameras);
+    refresh();
   }, []);
+
+  function refresh() {
+    api.getCameras().then(setCameras);
+  }
+
+  function showToast(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(""), 2500);
+  }
 
   const online = cameras.filter((c) => c.status === "Active").length;
   const avgHealth = cameras.length
@@ -45,7 +58,57 @@ export default function CameraManagement() {
     await api.addCamera(form);
     setAddOpen(false);
     setForm({ code: "", driveName: "", purpose: "", site: "" });
-    api.getCameras().then(setCameras);
+    refresh();
+  }
+
+  function openEdit(cam) {
+    setEditing({
+      id: cam.id,
+      camCode: cam.code,
+      label: cam.label,
+      purpose: cam.purpose || "General",
+      site: cam.site,
+      streamUrl: api.buildRtspUrl({
+        user: cam.user,
+        password: "",
+        host: cam.host,
+        port: cam.port,
+        streamPath: cam.streamPath,
+      }),
+      attendanceTracking: cam.attendanceTracking,
+    });
+  }
+
+  async function handleEditSubmit(e) {
+    e.preventDefault();
+    const parsed = api.parseRtspUrl(editing.streamUrl);
+    const payload = {
+      name: editing.label,
+      cam_code: editing.camCode,
+      purpose: editing.purpose,
+      site: editing.site,
+      host: parsed.host,
+      port: parsed.port,
+      user: parsed.user,
+      stream_path: parsed.streamPath,
+      attendance_tracking: editing.attendanceTracking,
+    };
+    // Password is never sent to the frontend, so the field only ever shows
+    // it blank — only overwrite the stored password if the user actually
+    // typed a new one into the URL.
+    if (parsed.password) payload.password = parsed.password;
+
+    await api.updateCamera(editing.id, payload);
+    setEditing(null);
+    showToast("Camera updated");
+    refresh();
+  }
+
+  async function handleDelete(cam) {
+    if (!window.confirm(`Remove camera "${cam.label}"? This cannot be undone.`)) return;
+    await api.deleteCamera(cam.id);
+    showToast(`${cam.label} removed`);
+    refresh();
   }
 
   return (
@@ -58,6 +121,12 @@ export default function CameraManagement() {
           </button>
         }
       />
+
+      {toast && (
+        <div className="text-sm text-success-600 bg-success-50 border border-success-500/20 rounded-lg px-3.5 py-2">
+          {toast}
+        </div>
+      )}
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Total Cameras" value={cameras.length} subTone="neutral" />
@@ -79,11 +148,23 @@ export default function CameraManagement() {
             { key: "live", label: "Live feed" },
             {
               key: "action",
-              label: "",
-              render: () => (
-                <div className="flex items-center gap-3 text-sm">
-                  <button className="text-brand-600 font-medium">Edit</button>
-                  <button className="text-danger-500 font-medium">Remove</button>
+              label: "Actions",
+              render: (r) => (
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => openEdit(r)}
+                    title="Edit"
+                    className="text-slate-400 hover:text-brand-600"
+                  >
+                    <Pencil size={15} />
+                  </button>
+                  <button
+                    onClick={() => handleDelete(r)}
+                    title="Delete"
+                    className="text-slate-400 hover:text-danger-500"
+                  >
+                    <Trash2 size={15} />
+                  </button>
                 </div>
               ),
             },
@@ -168,6 +249,111 @@ export default function CameraManagement() {
             Add
           </button>
         </form>
+      </Modal>
+
+      {/* --- Edit Camera ------------------------------------------------ */}
+      <Modal open={!!editing} onClose={() => setEditing(null)} title="Edit Camera" width="max-w-lg">
+        {editing && (
+          <form onSubmit={handleEditSubmit} className="space-y-5">
+            <p className="text-sm text-slate-500 -mt-3">Edit a camera and assign its site access.</p>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-sm font-medium text-ink-900 block mb-1.5">
+                  Camera Code <span className="text-danger-500">*</span>
+                </label>
+                <input
+                  required
+                  value={editing.camCode}
+                  onChange={(e) => setEditing((f) => ({ ...f, camCode: e.target.value }))}
+                  className="input-field"
+                />
+              </div>
+              <div>
+                <label className="text-sm font-medium text-ink-900 block mb-1.5">
+                  Camera Label <span className="text-danger-500">*</span>
+                </label>
+                <input
+                  required
+                  value={editing.label}
+                  onChange={(e) => setEditing((f) => ({ ...f, label: e.target.value }))}
+                  className="input-field"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-sm font-medium text-ink-900 block mb-1.5">
+                  Purpose <span className="text-danger-500">*</span>
+                </label>
+                <select
+                  required
+                  value={editing.purpose}
+                  onChange={(e) => setEditing((f) => ({ ...f, purpose: e.target.value }))}
+                  className="input-field"
+                >
+                  {[...new Set([editing.purpose, ...PURPOSES])].map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-sm font-medium text-ink-900 block mb-1.5">Site</label>
+                <input
+                  required
+                  value={editing.site}
+                  onChange={(e) => setEditing((f) => ({ ...f, site: e.target.value }))}
+                  className="input-field"
+                />
+              </div>
+            </div>
+
+            <div className="pt-1">
+              <p className="text-sm font-semibold text-ink-900 mb-3">Stream Configuration</p>
+              <label className="text-sm font-medium text-ink-900 block mb-1.5">
+                Stream URL <span className="text-danger-500">*</span>
+              </label>
+              <input
+                required
+                value={editing.streamUrl}
+                onChange={(e) => setEditing((f) => ({ ...f, streamUrl: e.target.value }))}
+                placeholder="rtsp://user:password@host:port/path"
+                className="input-field font-mono text-xs"
+              />
+              <p className="text-xs text-slate-400 mt-1.5">
+                The saved password is hidden for security and shown blank here. Leave it blank
+                to keep the current password, or type the full URL with a new password to change it.
+              </p>
+            </div>
+
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={editing.attendanceTracking}
+                onChange={(e) => setEditing((f) => ({ ...f, attendanceTracking: e.target.checked }))}
+                className="mt-0.5 accent-brand-500"
+              />
+              <span>
+                <span className="block text-sm font-medium text-ink-900">Enable attendance tracking</span>
+                <span className="block text-xs text-slate-500">
+                  Attendance events and employee check-ins will be processed using this camera.
+                </span>
+              </span>
+            </label>
+
+            <div className="flex items-center gap-3 pt-1">
+              <button type="button" onClick={() => setEditing(null)} className="btn-secondary flex-1">
+                Cancel
+              </button>
+              <button type="submit" className="btn-primary flex-1">
+                Submit
+              </button>
+            </div>
+          </form>
+        )}
       </Modal>
     </div>
   );

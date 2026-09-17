@@ -36,7 +36,8 @@ def init_db() -> None:
                 stream_path TEXT DEFAULT '',
                 vendor TEXT DEFAULT '',
                 status TEXT DEFAULT 'inactive',
-                live_feed_enabled INTEGER DEFAULT 1
+                live_feed_enabled INTEGER DEFAULT 1,
+                attendance_tracking INTEGER DEFAULT 1
             )
             """
         )
@@ -49,7 +50,17 @@ def init_db() -> None:
             )
             """
         )
+        _migrate_cameras_table(conn)
         _seed_sites_if_empty(conn)
+
+
+def _migrate_cameras_table(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS doesn't add new columns to an
+    already-existing table — this backfills them for databases created
+    before attendance_tracking existed."""
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(cameras)").fetchall()}
+    if "attendance_tracking" not in existing_cols:
+        conn.execute("ALTER TABLE cameras ADD COLUMN attendance_tracking INTEGER DEFAULT 1")
 
 
 def _seed_sites_if_empty(conn: sqlite3.Connection) -> None:
@@ -94,8 +105,8 @@ def add_camera(name: str, site: str, **fields) -> int:
         cur = conn.execute(
             """INSERT INTO cameras
                (name, site, cam_code, purpose, host, port, user, password, stream_path, vendor,
-                status, live_feed_enabled)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, live_feed_enabled, attendance_tracking)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 site,
@@ -109,6 +120,7 @@ def add_camera(name: str, site: str, **fields) -> int:
                 fields.get("vendor", ""),
                 "active" if fields.get("host") else "inactive",
                 int(fields.get("live_feed_enabled", True)),
+                int(fields.get("attendance_tracking", True)),
             ),
         )
         return cur.lastrowid

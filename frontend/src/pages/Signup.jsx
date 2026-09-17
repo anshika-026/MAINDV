@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AuthLayout from "../layouts/AuthLayout";
+import PasswordField from "../components/PasswordField";
 import { useAuth } from "../context/AuthContext";
 
 const STEPS = ["details", "account", "otp"];
@@ -90,14 +91,12 @@ export default function Signup() {
             </div>
             <div>
               <label className="text-sm font-medium text-ink-900 block mb-1.5">Create password</label>
-              <input
-                type="password"
+              <PasswordField
                 required
                 value={form.password}
                 onChange={(e) => update("password", e.target.value)}
                 placeholder="Password (min. 8 characters)"
                 minLength={8}
-                className="input-field"
               />
             </div>
             <button type="submit" className="btn-primary w-full">

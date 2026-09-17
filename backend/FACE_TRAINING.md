@@ -224,3 +224,137 @@ the server keeps running.
   `data/face_training/` are back to a clean, empty state, with the 21-entry
   employee roster (from a real `/employees/sync` run) kept since it's
   genuinely useful going forward.
+
+## Making 24-hour collection production-ready
+
+A follow-up audit (before any 24-hour run) found five real gaps, all fixed
+below. No changes to YOLO, InsightFace/ArcFace, `_embed()`, `_match()`,
+the classifier architecture/training code, employee IDs, or the manual
+labeling workflow — this section is entirely about the capture/ingestion
+side.
+
+### 1. Background collection, independent of any browser
+
+Previously, a capture only happened while `/ws/live/{camera_id}` had a real
+subscriber — no browser tab open meant no collection at all, regardless of
+foot traffic.
+
+**`backend/app/face_collection.py` (new)**: `start(camera_id)` /
+`stop(camera_id)` / `stop_all()` / `status()`. Reuses
+`camera_stream.CameraStream.subscribe()/unsubscribe()` unchanged — a
+`_CollectorSink` object with a no-op `put_nowait()` just occupies
+`CameraStream._subscribers` so the existing per-camera RTSP thread (and
+therefore `feed_frame()`) keeps running with zero real viewers. No second
+RTSP connection, no new thread, no frontend involvement — it lives entirely
+server-side and starts/stops only when explicitly told to.
+
+New endpoints (in `face_training_routes.py`):
+- `POST /api/faces/training/collection/start` `{"camera_id": N}`
+- `POST /api/faces/training/collection/stop` `{"camera_id": N}`
+- `GET /api/faces/training/collection/status` → active cameras + current
+  capture count vs. the limit
+
+Because it's the same `CameraStream`, it automatically inherits the
+existing RTSP reconnect handling in `camera_stream.py` — nothing new was
+needed for "survive a disconnect."
+
+### 2. Global hard capture limit
+
+`MAX_TRAINING_CAPTURES` (env var, default **15000**) in `face_pipeline.py`.
+Enforced atomically: `face_db.capture_limit_lock` (a module-level
+`threading.Lock`) guards a `count_training_captures()` check immediately
+before every insert in `_save_training_capture()`, so concurrent camera
+threads can never overshoot it, even by one. The count is across **all**
+cameras and **all** statuses combined (unlabeled/labeled/skipped/
+no_embedding/rejected) — once reached, new captures are silently dropped
+(not written to disk, not inserted); existing rows are never touched.
+
+### 3. Cross-track duplicate protection
+
+`CameraFacePipeline._is_recent_duplicate()` — reuses the exact cosine-
+similarity math `_match()` already does, no new model. Each pipeline
+instance keeps a short, per-camera, in-memory list of `(timestamp,
+embedding)` for captures with a real embedding. Before saving a new one, if
+its cosine similarity to anything in that list (pruned to the last
+`FACE_DEDUP_COOLDOWN_SECONDS`, default **120s**) is `>=
+FACE_DEDUP_SIMILARITY_THRESHOLD` (default **0.7**), it's dropped entirely
+— no file, no DB row.
+
+Deliberately narrow, per the requirement not to eliminate useful
+variation: per-camera only, and only a 2-minute window — this catches
+"ByteTrack lost and re-acquired the same person 10 seconds later" (a
+tracking artifact), not "the same employee walked past again an hour
+later" or "seen on a different camera," both of which are legitimate,
+separate training samples and are captured normally. **Verified with a
+controlled test**: same real embedding submitted twice within the cooldown
+→ second one deduped (capture count +0); a different real person's
+embedding submitted right after → inserted normally (+1).
+
+### 4. Embedding-less captures no longer pollute the labeling queue
+
+`face_training_captures.label_status` gained two new values, set at insert
+time in `_save_training_capture()`:
+- **`no_embedding`** — YOLO found a face but `_embed()` returned `None`.
+- **`rejected`** — has an embedding, but fails the quality gate (below).
+
+Neither is ever inserted as `'unlabeled'`, so `get_next_unlabeled_capture()`
+(unchanged — still just `WHERE label_status = 'unlabeled'`) never surfaces
+them in `/face-training`, and `get_labeled_training_embeddings()` (also
+unchanged) never trains on them. Nothing is deleted — both remain on disk
+and in the DB, queryable via `GET /api/faces/training/stats`'s new
+`by_status` breakdown, for diagnostics. `get_training_stats()`'s
+`reviewed`/`total` counters were also rescoped to only
+unlabeled/labeled/skipped, so the `/face-training` UI's "X / Y reviewed"
+counter isn't inflated by captures a human never actually saw.
+
+### 5. Quality filtering — thresholds from real measured data, not guesses
+
+Applied only to captures that already have an embedding (an embedding-less
+capture is always `no_embedding` regardless of quality). All configurable
+via env vars, in `face_pipeline.py`:
+
+| Constant | Default | Based on (real captures from this session) |
+|---|---|---|
+| `FACE_MIN_BLUR_SCORE` | 50 | Observed range 2776–4432 (variance of Laplacian) — the floor sits ~55-90x below every real sample, so it only rejects genuinely degenerate frames |
+| `FACE_MIN_BRIGHTNESS` / `FACE_MAX_BRIGHTNESS` | 20 / 235 | Observed range 109–138 (mean grayscale) — wide margin on both sides, only catches near-black/near-blown-out frames |
+| `FACE_MIN_AREA` | 900 px² | Observed approx. tight-bbox areas: the two captures that *failed* to embed were 1517 and 2022 px²; the two that succeeded were 2400 and 2654 px². Set well below even the failing samples deliberately — not tuned to this n=4 sample, just a sanity floor against genuinely tiny/distant detections |
+
+None of these were picked to hit a target rejection rate — they're
+conservative floors documented against the actual numbers observed,
+per the instruction not to invent aggressive thresholds on a small sample.
+
+### Verified (tests A–J, all against the real running backend, not mocked)
+
+| # | What | Result |
+|---|---|---|
+| A | Background collection runs with zero browser/websocket viewers | **PASS** — started via API only, `netstat` showed no ESTABLISHED connections throughout |
+| B | One camera produces real captures | **PASS** — camera 3, 7 new captures over ~75s unattended |
+| C | Valid JPEGs + valid ArcFace embeddings | **PASS** — 5/7 had real 512-dim embeddings, all image files verified on disk |
+| D | `employee_id` NULL, correct `label_status` | **PASS** |
+| E | Embedding-less captures excluded from the labeling queue | **PASS** — confirmed directly in the DB (`no_embedding` status) and by the unchanged, already-filtered `/next` query |
+| F | Global limit never exceeded | **PASS** — restarted with `MAX_TRAINING_CAPTURES=14` (12 existing + margin), ran collection 90s, landed at exactly 14, `limit_reached: true` |
+| G | Cross-track dedup, controlled test | **PASS** — same embedding twice within cooldown → +1 then +0; different person right after → +1 |
+| H | Existing live-view unaffected | **PASS** |
+| I | Existing `/face-training` labeling unaffected | **PASS** |
+| J | Explicit classifier training unaffected | **PASS** — trained on 4 real labeled samples across 2 employees |
+
+All test-generated captures, images, and the test-only classifier were
+removed afterward; `data/face_training/` and `face_training_captures` are
+back to empty, the 21-entry real employee roster was kept.
+
+### Remaining limitations, going into a real 24-hour run
+
+- **Still no automatic "restart collection on backend restart" or
+  persistence of which cameras were collecting** — if the backend process
+  restarts mid-collection, you'll need to call `/collection/start` again
+  for each camera. Not implemented (wasn't asked for); worth knowing before
+  a real unattended 24-hour run.
+- **The dedup window is per-camera, not cross-camera** — the same person
+  visible on two adjacent cameras within the cooldown window would still
+  produce two captures (by design — different cameras are different
+  vantage points, arguably legitimately different training samples, but
+  worth knowing).
+- **`MAX_TRAINING_CAPTURES` is a blunt global cutoff, not a per-camera
+  fair-share** — if one busy camera fills the quota first, quieter cameras
+  collecting at the same time could end up under-represented. Not fixed,
+  since the requirement was "never exceed," not "distribute fairly."

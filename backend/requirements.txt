@@ -20,3 +20,10 @@ supervision==0.30.3
 # embeddings (Option B); joblib (de)serializes it to/from disk.
 scikit-learn==1.9.1
 joblib==1.6.0
+
+# License management — signs/renders the per-license QR code (license_qr.py).
+# JWT here is only used to sign that QR payload, not for user auth/sessions
+# (this app has no real auth system yet — see license_db.py).
+PyJWT==2.14.0
+qrcode==8.2
+pillow==12.3.0

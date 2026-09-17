@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Calendar, ChevronRight, Download, MapPin, Pencil, Search, Trash2, UserPlus, X } from "lucide-react";
+import { Calendar, ChevronRight, Download, MapPin, Pencil, Trash2, UserPlus, X } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import DataTable from "../components/DataTable";
 import StatusBadge from "../components/StatusBadge";
@@ -124,8 +124,11 @@ export default function People() {
     setForm((f) => ({ ...f, photos: f.photos.filter((p) => p.id !== id) }));
   }
 
+  // Last name is NOT required — real synced employee records are often a
+  // single word (e.g. "Priya"), and requiring one would leave the Continue
+  // button permanently disabled for them.
   const canContinue =
-    form.firstName.trim() && form.lastName.trim() && (form.type === "Employee" ? form.department : form.host.trim());
+    form.firstName.trim() && (form.type === "Employee" ? form.department : form.host.trim());
 
   function finishEnrollment() {
     const name = `${form.firstName} ${form.lastName}`.trim();
@@ -197,8 +200,9 @@ export default function People() {
     setEditing((f) => ({ ...f, photos: f.photos.filter((p) => p.id !== id) }));
   }
 
+  // Same as canContinue above — don't require a last name.
   const canContinueEdit =
-    editing && editing.firstName.trim() && editing.lastName.trim() &&
+    editing && editing.firstName.trim() &&
     (editing.type === "Employee" ? editing.department : editing.host.trim());
 
   function saveEdit() {
@@ -215,6 +219,18 @@ export default function People() {
       designs: editing.photos.length,
     };
     editing.setList((prev) => prev.map((r) => (r === editing.original ? { ...r, ...updated } : r)));
+
+    // The employee ID itself has nowhere else to persist — the external
+    // roster service this page reads from has no update API — so without
+    // this it silently reverted on the next refresh. Keyed on the
+    // ORIGINAL (pre-edit) name, since that's the stable id the override
+    // table and the next getPeople() fetch both match on.
+    if (isEmployee && editing.employeeId.trim() && editing.employeeId !== editing.original.employeeId) {
+      api.setPersonEmployeeId(editing.original.name, editing.employeeId.trim()).catch(() => {
+        showToast("Employee ID could not be saved — try again");
+      });
+    }
+
     showToast("Details updated");
     closeEdit();
   }
@@ -395,7 +411,7 @@ export default function People() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title="People"
+        title="Identity"
         action={
           <div className="flex items-center gap-3">
             <button
@@ -463,12 +479,11 @@ export default function People() {
         </div>
 
         <div className="relative flex-1 min-w-[180px] max-w-xs">
-          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={tab === "Employee" ? "Search by employee name, Emp ID" : "Search by name"}
-            className="input-field pl-9"
+            className="input-field"
           />
         </div>
       </div>
@@ -527,9 +542,8 @@ export default function People() {
               />
             </div>
             <div>
-              <label className="text-sm font-medium text-ink-900 block mb-1.5">Last name</label>
+              <label className="text-sm font-medium text-ink-900 block mb-1.5">Last name (optional)</label>
               <input
-                required
                 value={form.lastName}
                 onChange={(e) => setForm((f) => ({ ...f, lastName: e.target.value }))}
                 className="input-field"
@@ -675,9 +689,8 @@ export default function People() {
               />
             </div>
             <div>
-              <label className="text-sm font-medium text-ink-900 block mb-1.5">Last name</label>
+              <label className="text-sm font-medium text-ink-900 block mb-1.5">Last name (optional)</label>
               <input
-                required
                 value={editing.lastName}
                 onChange={(e) => setEditing((f) => ({ ...f, lastName: e.target.value }))}
                 className="input-field"

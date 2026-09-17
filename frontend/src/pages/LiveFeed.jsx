@@ -17,6 +17,11 @@ export default function LiveFeed() {
   const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
+    // GET /api/cameras is scoped server-side now (backend/app/main.py):
+    // an admin session gets every camera, a client session only their own
+    // license's assigned cameras — trust the response directly rather
+    // than re-filtering client-side against a locally cached allow-list,
+    // which could go stale the moment an admin changes that assignment.
     api.getCameras().then(setCameras);
   }, []);
 
@@ -37,7 +42,7 @@ export default function LiveFeed() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Live feed" />
+      <PageHeader title="Vision" />
 
       <div className="card p-4 flex flex-wrap items-center gap-6">
         <div className="flex items-center gap-4">

@@ -20,7 +20,15 @@ export default function useLiveCameraFeed(camera) {
     const img = new Image();
     let objectUrl = null;
 
-    const ws = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}`);
+    // Browsers can't attach an Authorization header to a WebSocket
+    // handshake, so the session token travels as a query param instead —
+    // the backend (main.py's _authorize_camera_ws) looks it up the same
+    // way it would a header, and closes the connection if it's missing,
+    // expired, or doesn't own this camera.
+    const token = localStorage.getItem("deco_token") || "";
+    const ws = new WebSocket(
+      `${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}?token=${encodeURIComponent(token)}`
+    );
     ws.binaryType = "blob";
     ws.onopen = () => setStatus("live");
     ws.onclose = () => setStatus("offline");

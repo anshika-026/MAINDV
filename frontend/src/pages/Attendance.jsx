@@ -75,7 +75,7 @@ export default function Attendance() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Attendance"
+        title="Presence"
         action={
           <button onClick={() => setLeaveOpen(true)} className="btn-secondary text-sm">
             Mark Leave

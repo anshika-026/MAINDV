@@ -36,6 +36,7 @@ Model files:
       ~/.insightface/models/buffalo_l.
 """
 
+import logging
 import os
 import time
 import uuid
@@ -51,6 +52,8 @@ from ultralytics import YOLO
 import insightface
 
 from app import face_db
+
+log = logging.getLogger("face_pipeline")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -98,6 +101,66 @@ REVIEW_DEDUPE_SECONDS = 60  # don't re-queue the same track more than once per m
 TRAINING_CAPTURE_DIR = os.environ.get("FACE_TRAINING_DIR", str(_DATA_DIR / "face_training"))
 TRAINING_UNLABELED_DIR = os.path.join(TRAINING_CAPTURE_DIR, "_unlabeled")
 
+# --- Multi-day collection controls (see FACE_TRAINING.md "7-day collection
+# sessions") — unchanged from the shorter-run design except where noted. ---
+
+# Hard ceiling across ALL cameras combined, ALL statuses combined — enforced
+# atomically in face_db.py (capture_limit_lock + count_training_captures())
+# so concurrent camera threads can never overshoot it. Deliberately left at
+# 15000 for a 7-day run too, per explicit instruction not to just raise this
+# — a week-long dataset is meant to stay useful/diverse within this budget
+# (see the dedup and per-camera controls below), not grow unbounded with run
+# length.
+MAX_TRAINING_CAPTURES = int(os.environ.get("MAX_TRAINING_CAPTURES", "15000"))
+
+# Per-camera share of that same budget — stops one busy camera (e.g. a main
+# entrance) from consuming the entire 15000-capture allowance before quieter
+# cameras contribute anything. Default: 1/3 of the global limit, so no
+# single camera can dominate even if only 2-3 cameras are actually active,
+# while still leaving room for one camera to run alone if that's all that's
+# configured. Enforced the same atomic way as MAX_TRAINING_CAPTURES.
+MAX_CAPTURES_PER_CAMERA = int(os.environ.get("FACE_MAX_CAPTURES_PER_CAMERA", str(MAX_TRAINING_CAPTURES // 3)))
+
+# Cross-track duplicate protection: if a new capture's embedding is at least
+# DEDUP_SIMILARITY_THRESHOLD cosine-similar to one captured on the SAME
+# camera within the last DEDUP_COOLDOWN_SECONDS, it's treated as almost
+# certainly the same physical appearance re-surfacing (ByteTrack losing and
+# re-acquiring the same person, brief occlusion, a quick RTSP reconnect) and
+# is dropped before ever touching disk/DB. Deliberately per-camera — this is
+# NOT identity recognition (no gallery/employee_id involved) and must never
+# suppress the same real person showing up again later or on a different
+# camera. See _is_recent_duplicate().
+#
+# Default raised from 120s (the original single-day design) to 900s (15
+# min) for multi-day runs: at 120s, someone with even mildly flickery
+# tracking sitting in one spot all day could still generate a new capture
+# every ~2 minutes — up to ~240/day, times 7 days, of what's essentially one
+# person. 15 minutes caps that to at most ~32/day per person per camera
+# while still capturing them several times across a day (different times,
+# lighting, pose) rather than just once — the "diverse, not just numerous"
+# balance the 7-day plan calls for.
+DEDUP_COOLDOWN_SECONDS = float(os.environ.get("FACE_DEDUP_COOLDOWN_SECONDS", "900"))
+DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("FACE_DEDUP_SIMILARITY_THRESHOLD", "0.7"))
+
+# Default session length for POST /api/faces/training/collection/start when
+# no `days` is given.
+DEFAULT_COLLECTION_DAYS = float(os.environ.get("FACE_COLLECTION_DAYS", "7"))
+
+# How often the background expiry watcher (face_collection.py) checks
+# whether a running session's planned end time has passed.
+SESSION_CHECK_INTERVAL_SECONDS = float(os.environ.get("FACE_SESSION_CHECK_INTERVAL", "60"))
+
+# Quality gate applied ONLY to captures that already have an embedding —
+# values below are conservative floors/ceiling, deliberately set well
+# outside the range actually observed in real test captures (see
+# FACE_TRAINING.md for the measured numbers this was based on), so this
+# rejects only genuinely degenerate frames, not normal variation.
+MIN_BLUR_SCORE = float(os.environ.get("FACE_MIN_BLUR_SCORE", "50"))
+MIN_BRIGHTNESS = float(os.environ.get("FACE_MIN_BRIGHTNESS", "20"))
+MAX_BRIGHTNESS = float(os.environ.get("FACE_MAX_BRIGHTNESS", "235"))
+# Approximate tight-YOLO-bbox area in pixels^2 (not the padded crop area).
+MIN_FACE_AREA = float(os.environ.get("FACE_MIN_AREA", "900"))
+
 # Trained classifier (see face_training.py) — frozen ArcFace embeddings stay
 # the feature extractor; this is the supervised layer trained on labeled
 # camera captures. Absent until you run POST /api/faces/training/train, at
@@ -118,6 +181,7 @@ class TrackState:
     track_id: int
     best_score: float = -1.0   # proxy for "quality" — we use bbox area * detection conf
     best_conf: float = -1.0    # raw detection confidence at the best_score frame
+    best_area: float = 0.0     # raw (tight, unpadded) YOLO bbox area at the best_score frame
     best_crop: np.ndarray | None = None
     last_seen_frame: int = 0
     recognized_person_id: str | None = None
@@ -142,6 +206,11 @@ class CameraFacePipeline:
         self._last_sample_time = 0.0
         self._gallery_cache: list[dict] = []
         self._gallery_loaded_at = 0.0
+        # Recent (timestamp, embedding) pairs for THIS camera only, used by
+        # _is_recent_duplicate() — only ever read/written by this camera's
+        # own background thread (feed_frame is called from exactly one
+        # thread per camera, see camera_stream.py), so no lock needed here.
+        self._recent_captures: list[tuple[float, np.ndarray]] = []
         self._ensure_models_loaded()
 
         # ByteTrack: lightweight, no GPU needed, just IoU + Kalman motion.
@@ -268,6 +337,7 @@ class CameraFacePipeline:
             if quality > state.best_score:
                 state.best_score = quality
                 state.best_conf = score
+                state.best_area = area
                 state.best_crop = crop.copy()
 
         # Drop stale tracks and flush any that finished (left frame / went stale)
@@ -341,29 +411,119 @@ class CameraFacePipeline:
     def _match_threshold(self) -> float:
         return CLASSIFIER_MIN_PROBA if self._get_classifier() is not None else MATCH_THRESHOLD
 
+    def _is_recent_duplicate(self, embedding: np.ndarray) -> bool:
+        """True if `embedding` is highly similar to one captured on THIS
+        camera within the last DEDUP_COOLDOWN_SECONDS — almost certainly the
+        same physical appearance re-surfacing under a new track_id (tracking
+        flicker, brief occlusion, a quick RTSP reconnect), not a genuinely
+        new sighting. Deliberately narrow in scope:
+          - per-camera only (each pipeline instance has its own list)
+          - cooldown window (default 900s / 15 min for multi-day runs — see
+            DEDUP_COOLDOWN_SECONDS) — does NOT suppress the same person
+            appearing again later in the day, nor on a different camera
+          - a single cosine-similarity check against recent embeddings,
+            reusing the exact same math _match() already uses — no new
+            model, no employee_id involved, nothing is auto-labeled.
+        """
+        now = time.time()
+        self._recent_captures = [
+            (t, e) for t, e in self._recent_captures if now - t <= DEDUP_COOLDOWN_SECONDS
+        ]
+        for _, recent_embedding in self._recent_captures:
+            if float(np.dot(embedding, recent_embedding)) >= DEDUP_SIMILARITY_THRESHOLD:
+                return True
+        return False
+
     def _save_training_capture(self, state: TrackState, embedding: np.ndarray | None):
         """Every finished track lands here, unconditionally — confident
         match, low-confidence, or no embedding at all. This is the bulk
         dataset for manual labeling; face_pending (below) stays a separate,
         narrower live-correction queue. Never lets a failure here stop
         recognition — worst case, this capture is silently missing from the
-        training set."""
+        training set.
+
+        Gates, in order:
+          1. Cross-track duplicate check (embedding-based, see
+             _is_recent_duplicate) — skips entirely, no file, no DB row.
+             Counted (face_db.increment_running_session_duplicates_rejected)
+             purely for monitoring visibility into how much this is
+             happening; the count is session-scoped, not enforcement.
+          2. MAX_TRAINING_CAPTURES — a global, all-cameras, all-statuses
+             ceiling — and MAX_CAPTURES_PER_CAMERA — this camera's share of
+             it — both checked+enforced atomically via
+             face_db.capture_limit_lock so concurrent camera threads can't
+             overshoot either.
+          3. label_status is decided from embedding presence + quality
+             metrics: only a capture with a real embedding AND acceptable
+             blur/brightness/face-size becomes 'unlabeled' (the only status
+             /face-training's queue ever shows). Everything else is still
+             saved (nothing is deleted) as 'no_embedding' or 'rejected' for
+             diagnostics, but is invisible to the labeling queue and
+             excluded from classifier training.
+        """
         try:
-            blur, brightness = self._quality_metrics(state.best_crop)
-            image_path = os.path.join(
-                TRAINING_UNLABELED_DIR,
-                f"cam{self.camera_id}_track{state.track_id}_{uuid.uuid4().hex[:8]}.jpg",
-            )
-            cv2.imwrite(image_path, state.best_crop)
-            face_db.add_training_capture(
-                camera_id=self.camera_id,
-                track_id=state.track_id,
-                image_path=image_path,
-                embedding=embedding.tolist() if embedding is not None else None,
-                detection_confidence=state.best_conf,
-                blur_score=blur,
-                brightness=brightness,
-            )
+            if embedding is not None and self._is_recent_duplicate(embedding):
+                try:
+                    face_db.increment_running_session_duplicates_rejected()
+                except Exception:
+                    pass
+                return
+
+            with face_db.capture_limit_lock:
+                if face_db.count_training_captures() >= MAX_TRAINING_CAPTURES:
+                    return
+                if face_db.count_training_captures_for_camera(self.camera_id) >= MAX_CAPTURES_PER_CAMERA:
+                    return
+
+                blur, brightness = self._quality_metrics(state.best_crop)
+
+                if embedding is None:
+                    label_status = "no_embedding"
+                elif (
+                    blur < MIN_BLUR_SCORE
+                    or not (MIN_BRIGHTNESS <= brightness <= MAX_BRIGHTNESS)
+                    or state.best_area < MIN_FACE_AREA
+                ):
+                    label_status = "rejected"
+                else:
+                    label_status = "unlabeled"
+
+                image_path = os.path.join(
+                    TRAINING_UNLABELED_DIR,
+                    f"cam{self.camera_id}_track{state.track_id}_{uuid.uuid4().hex[:8]}.jpg",
+                )
+                write_ok = cv2.imwrite(image_path, state.best_crop)
+                # Never create a DB row for an image that isn't actually
+                # sitting on disk — cv2.imwrite() can return True yet still
+                # not leave a readable file behind on some setups (e.g. a
+                # synced/cloud-backed folder interfering with a burst of
+                # small file writes), which previously produced orphaned
+                # rows whose /face-training image would silently 404. Both
+                # checks: the call's own return value, and a real stat.
+                if not write_ok or not os.path.exists(image_path):
+                    log.error(
+                        "camera %s: wrote training capture image but it's not on disk afterward (%s) — dropping this capture",
+                        self.camera_id, image_path,
+                    )
+                    return
+                face_db.add_training_capture(
+                    camera_id=self.camera_id,
+                    track_id=state.track_id,
+                    image_path=image_path,
+                    embedding=embedding.tolist() if embedding is not None else None,
+                    detection_confidence=state.best_conf,
+                    blur_score=blur,
+                    brightness=brightness,
+                    label_status=label_status,
+                )
+
+            try:
+                face_db.touch_running_collection_session()
+            except Exception:
+                pass
+
+            if embedding is not None:
+                self._recent_captures.append((time.time(), embedding))
         except Exception:
             pass
 

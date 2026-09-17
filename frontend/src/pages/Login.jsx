@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AuthLayout from "../layouts/AuthLayout";
+import PasswordField from "../components/PasswordField";
 import { useAuth } from "../context/AuthContext";
 
 export default function Login() {
@@ -49,13 +50,11 @@ export default function Login() {
               Forgot password?
             </Link>
           </div>
-          <input
-            type="password"
+          <PasswordField
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="Password"
-            className="input-field"
           />
         </div>
 
@@ -70,6 +69,12 @@ export default function Login() {
         Don't have an account?{" "}
         <Link to="/signup" className="text-brand-600 font-medium">
           Create your account
+        </Link>
+      </p>
+      <p className="text-sm text-slate-500 text-center mt-2">
+        Client portal login?{" "}
+        <Link to="/client-login" className="text-brand-600 font-medium">
+          Log in here
         </Link>
       </p>
     </AuthLayout>
