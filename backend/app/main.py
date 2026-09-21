@@ -5,7 +5,7 @@ from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import auth, camera_db, camera_stream, config, face_collection, face_db, license_db
+from . import auth, camera_db, camera_stream, config, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
 from . import face_routes, face_training_routes, license_routes
 
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +38,11 @@ def on_startup():
     # create a duplicate worker per camera.
     face_collection.ensure_expiry_watcher_started()
     face_collection.resume_if_needed()
+    # Periodic background retraining trigger (new labeled samples
+    # accumulate -> auto-retrain) — separate daemon thread, never blocks
+    # the camera pipelines or request handling. See
+    # face_training_scheduler.py.
+    face_training_scheduler.ensure_scheduler_started()
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +296,47 @@ def _drop_oldest_and_put(queue: asyncio.Queue, item: bytes) -> None:
 
 @app.websocket("/ws/detections/{camera_id}")
 async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None = None):
-    """No detection pipeline wired up yet — send empty frames on a steady
-    interval so CameraTile's overlay socket connects cleanly instead of
-    erroring, without claiming to detect anything. Authorized the same
-    way as /ws/live above even though there's no real per-camera data
-    behind it yet — consistent enforcement now means nothing has to
-    change here later once real detection output is added."""
+    """Live PERSON overlay for LiveCameraTile/CameraViewerModal — reads
+    face_pipeline.CameraFacePipeline.get_live_detections(), which is now
+    person-track-based (full-body box, person-first — see
+    _update_person_overlay): a person is listed here regardless of whether
+    their face is currently visible/recognized. `employee_id`/`name` are
+    only set once face recognition inside that person's box is confident
+    AND temporally stable; otherwise the frontend shows "Person", never
+    "Unknown". Populated by the same pipeline that already processes this
+    camera's frames for /ws/live — no second inference path. fire_smoke
+    stays [] — no such detector exists in this codebase. Authorized the
+    same way as /ws/live."""
     await websocket.accept()
     if not _authorize_camera_ws(token, camera_id):
         await websocket.close(code=4401)
         return
     try:
         while True:
-            await websocket.send_json({"faces": [], "fire_smoke": []})
-            await asyncio.sleep(1)
+            pipeline = face_pipeline.get_existing_pipeline(camera_id)
+            people = []
+            if pipeline is not None:
+                for det in pipeline.get_live_detections():
+                    emp_id = det["employee_id"]
+                    people.append({
+                        "track_id": det["track_id"],
+                        "bbox": det["bbox"],
+                        "employee_id": emp_id,
+                        "name": _employee_display_name(emp_id) if emp_id else None,
+                        "confidence": det["confidence"],
+                    })
+            await websocket.send_json({"people": people, "fire_smoke": []})
+            await asyncio.sleep(0.3)
     except WebSocketDisconnect:
         pass
+
+
+def _employee_display_name(employee_id: str) -> str:
+    """Resolves a classifier's predicted employee_id to a real name from
+    the SAME roster face-training validates labels against (face_db's
+    employees table) — never invents a name; falls back to the bare ID if
+    that roster doesn't (yet) have an entry for it."""
+    for e in face_db.list_employees():
+        if e["employee_id"] == employee_id:
+            return e["name"]
+    return employee_id

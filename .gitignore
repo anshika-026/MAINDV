@@ -1,0 +1,38 @@
+# Runtime application data — the live SQLite database, camera capture/
+# training images, and biometric embeddings this app generates while
+# running. Never source code, always machine-specific and constantly
+# changing; must never be committed. (Note: backend/data is actually a
+# symlink to C:\DecoVisionData on this machine — these patterns are
+# written as the repo-relative paths git itself reports, which resolve
+# through that symlink correctly.)
+backend/data/app.db
+backend/data/face_training/
+backend/data/face_captures/
+backend/data/face_pending/
+backend/data/face_training_captures/
+
+# Local secrets/config — real per-machine values (camera hosts, ports,
+# CORS origins), never meant to be shared via git. .env.example stays
+# tracked as the template.
+backend/.env
+frontend/.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.venv/
+.venv-1/
+venv/
+
+# Node/frontend build output
+node_modules/
+dist/
+
+# Claude Code session/tooling state — not application source code.
+.claude/

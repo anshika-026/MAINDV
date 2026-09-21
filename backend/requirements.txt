@@ -20,6 +20,12 @@ supervision==0.30.3
 # embeddings (Option B); joblib (de)serializes it to/from disk.
 scikit-learn==1.9.1
 joblib==1.6.0
+# CPU-load check for face_training_scheduler.py — lets background auto-retrain
+# defer to the next cycle instead of competing with the live camera pipelines.
+psutil==7.2.2
+# Caps OpenBLAS/OpenMP thread count during classifier fit (face_training.py)
+# so a training run doesn't compete with the live camera pipeline for cores.
+threadpoolctl==3.6.0
 
 # License management — signs/renders the per-license QR code (license_qr.py).
 # JWT here is only used to sign that QR payload, not for user auth/sessions

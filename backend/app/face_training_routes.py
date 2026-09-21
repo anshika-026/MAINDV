@@ -39,7 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app import auth, camera_db, face_collection, face_db
+from app import auth, camera_db, face_collection, face_db, face_training_scheduler
 from app.face_pipeline import (
     CLASSIFIER_PATH,
     MAX_CAPTURES_PER_CAMERA,
@@ -96,6 +96,10 @@ class CollectionStartRequest(BaseModel):
 
 class CollectionStopRequest(BaseModel):
     camera_id: int | None = None  # omit to stop everything and end the session
+
+
+class AutoTrainToggleRequest(BaseModel):
+    enabled: bool
 
 
 def _capture_public(row: dict) -> dict:
@@ -347,6 +351,32 @@ def model_status():
     }
 
 
+@router.get("/auto-train/status")
+def auto_train_status():
+    """Background periodic-retraining scheduler state — see
+    face_training_scheduler.py. Also folded into /collection/status for a
+    single combined monitoring call."""
+    return face_training_scheduler.get_status()
+
+
+@router.post("/auto-train/toggle")
+def auto_train_toggle(req: AutoTrainToggleRequest):
+    """Pause/resume automatic retraining without a restart. Manual
+    POST /train is unaffected either way — this only controls the
+    background trigger."""
+    face_training_scheduler.set_enabled(req.enabled)
+    return {"ok": True, **face_training_scheduler.get_status()}
+
+
+@router.get("/training-history")
+def training_history(limit: int = 20):
+    """Newest-first record of every completed training run (see
+    face_training.train_classifier -> face_db.add_training_run) — real
+    measured numbers only, nothing estimated. Powers the 'Face Model
+    Training' history panel in FaceTraining.jsx."""
+    return face_db.list_training_runs(limit)
+
+
 # ---------------------------------------------------------------------------
 # Background collection — runs independently of any browser live-view, and
 # (as of the 7-day plan) independently of this backend process staying up
@@ -429,4 +459,6 @@ def collection_status():
         "reviewable_total": stats["total"],  # unlabeled+labeled+skipped — excludes no_embedding/rejected
         "per_camera": per_camera,
         "disk_usage_bytes": face_collection.get_disk_usage_bytes(),
+        "training": face_training_scheduler.get_status(),
+        "model": model_status(),
     }

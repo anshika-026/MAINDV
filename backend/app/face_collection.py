@@ -72,7 +72,7 @@ def start(camera_id: int) -> bool:
         if camera_id in _active:
             return True
         sink = _CollectorSink()
-        camera_stream.get_stream(camera_id).subscribe(sink)
+        camera_stream.get_stream(camera_id).subscribe(sink, is_collector=True)
         _active[camera_id] = sink
     log.info("face collection started for camera %s", camera_id)
     return True

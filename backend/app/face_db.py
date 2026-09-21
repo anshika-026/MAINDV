@@ -155,6 +155,38 @@ def init_face_tables():
         ON collection_sessions(status)
     """)
 
+    # One row per completed `python -m app.train_faces` / POST /training/train
+    # run — see face_training.train_classifier(). Never written on a failed
+    # run (nothing to report), never written to except by that one call site.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS training_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trained_at REAL NOT NULL,
+            sample_count INTEGER NOT NULL,
+            class_count INTEGER NOT NULL,
+            -- excluded_* are nullable: a run backfilled from before this
+            -- history table existed may not have these diagnostic counts
+            -- available — NULL means "not recorded", never a guessed 0.
+            excluded_no_embedding INTEGER,
+            excluded_rejected INTEGER,
+            excluded_too_few_samples INTEGER,
+            validation_samples INTEGER,
+            validation_classes INTEGER,
+            validation_accuracy REAL,
+            model_path TEXT NOT NULL,
+            per_employee_counts TEXT NOT NULL  -- JSON {employee_id: count}
+        )
+    """)
+    # Added later: per-class validation breakdown (accuracy/false-accept/
+    # false-reject per employee, plus a confusion matrix) — a real run from
+    # before this existed just won't have one (NULL), never backfilled with
+    # a guessed value. SQLite has no "ADD COLUMN IF NOT EXISTS"; catching
+    # the duplicate-column error is the standard idempotent pattern here.
+    try:
+        cur.execute("ALTER TABLE training_runs ADD COLUMN per_class_validation TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -372,13 +404,6 @@ def delete_employees_not_in(employee_ids: set[str]) -> int:
                 tuple(employee_ids),
             )
     conn.commit()
-    conn.close()
-    return n
-
-
-def count_employees() -> int:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()["c"]
     conn.close()
     return n
 
@@ -605,6 +630,33 @@ def skip_training_capture(capture_id: int) -> None:
         conn.close()
 
 
+def count_labeled_since(ts: float) -> int:
+    """Number of captures labeled strictly after `ts` — used by
+    face_training_scheduler.py to decide whether enough new human-labeled
+    data has accumulated since the last training run to justify another one.
+    ts=0 (no prior run) counts every labeled row ever."""
+    conn = get_conn()
+    n = conn.execute(
+        "SELECT COUNT(*) AS c FROM face_training_captures WHERE label_status = 'labeled' AND labeled_at > ?",
+        (ts,),
+    ).fetchone()["c"]
+    conn.close()
+    return n
+
+
+def count_captures_since(ts: float) -> int:
+    """Total new raw captures (any label_status) since `ts` — distinct from
+    count_labeled_since, which only counts ones a human has since labeled.
+    Used for the "samples added today" status field: collection can add
+    captures much faster than they get labeled, so both numbers matter."""
+    conn = get_conn()
+    n = conn.execute(
+        "SELECT COUNT(*) AS c FROM face_training_captures WHERE captured_at > ?", (ts,)
+    ).fetchone()["c"]
+    conn.close()
+    return n
+
+
 def get_recent_labeled_captures(limit: int = 8) -> list[dict]:
     """Newest-first labeled captures, for the labeling page's correction
     list (see /recent-labels) — lets someone fix a just-typed wrong ID
@@ -768,6 +820,56 @@ def increment_running_session_duplicates_rejected() -> None:
     )
     conn.commit()
     conn.close()
+
+
+def add_training_run(
+    sample_count: int,
+    class_count: int,
+    excluded_no_embedding: int,
+    excluded_rejected: int,
+    excluded_too_few_samples: int,
+    model_path: str,
+    per_employee_counts: dict[str, int],
+    validation_samples: int | None = None,
+    validation_classes: int | None = None,
+    validation_accuracy: float | None = None,
+    per_class_validation: dict | None = None,
+) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        """INSERT INTO training_runs
+           (trained_at, sample_count, class_count, excluded_no_embedding,
+            excluded_rejected, excluded_too_few_samples, validation_samples,
+            validation_classes, validation_accuracy, model_path, per_employee_counts,
+            per_class_validation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            time.time(), sample_count, class_count, excluded_no_embedding,
+            excluded_rejected, excluded_too_few_samples, validation_samples,
+            validation_classes, validation_accuracy, model_path, json.dumps(per_employee_counts),
+            json.dumps(per_class_validation) if per_class_validation is not None else None,
+        ),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def list_training_runs(limit: int = 20) -> list[dict]:
+    """Newest-first training history — see /training-history."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM training_runs ORDER BY trained_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["per_employee_counts"] = json.loads(d["per_employee_counts"])
+        d["per_class_validation"] = json.loads(d["per_class_validation"]) if d.get("per_class_validation") else None
+        out.append(d)
+    return out
 
 
 def finish_collection_session(session_id: int, status: str) -> None:

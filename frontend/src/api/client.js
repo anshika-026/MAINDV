@@ -372,18 +372,8 @@ async function facesRequest(path, options = {}) {
 export function getNextTrainingCapture() {
   return trainingRequest("/next");
 }
-export function getTrainingStats() {
-  return trainingRequest("/stats");
-}
 export function getTrainingEmployees() {
   return trainingRequest("/employees");
-}
-// Best-effort: the labeling page calls this before loading the roster so an
-// ID/name edited on the external face-enrollment service shows up here
-// without anyone having to remember to sync manually. Never blocks the page
-// if that external service is briefly unreachable.
-export function syncTrainingEmployees() {
-  return trainingRequest("/employees/sync", { method: "POST" });
 }
 // Deliberately NOT a plain URL for an <img src> — /faces/training/image/{id}
 // requires an admin session (see face_training_routes.py's router-level
@@ -424,6 +414,9 @@ export function unlabelTrainingCapture(captureId) {
 }
 export function getRecentTrainingLabels(limit = 8) {
   return trainingRequest(`/recent-labels?limit=${limit}`);
+}
+export function getTrainingHistory(limit = 10) {
+  return trainingRequest(`/training-history?limit=${limit}`);
 }
 
 // ---- License management ---------------------------------------------

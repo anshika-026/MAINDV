@@ -34,14 +34,24 @@ class CameraStream:
         self.camera_id = camera_id
         self._lock = threading.Lock()
         self._subscribers: set = set()
+        # Subset of _subscribers that are background collectors (see
+        # face_collection.py's _CollectorSink), not a real person watching
+        # the live feed — used by has_real_viewer() below so the (expensive)
+        # person-detection overlay only runs while someone can actually see
+        # it, not 24/7 just because background collection keeps this
+        # thread alive. Never touches whether frames are broadcast/collected
+        # — only whether the EXTRA person-overlay work happens.
+        self._collector_subscribers: set = set()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._face_pipeline = None
         self._face_pipeline_failed = False
 
-    def subscribe(self, queue) -> None:
+    def subscribe(self, queue, is_collector: bool = False) -> None:
         with self._lock:
             self._subscribers.add(queue)
+            if is_collector:
+                self._collector_subscribers.add(queue)
             if self._thread is None or not self._thread.is_alive():
                 self._stop.clear()
                 self._thread = threading.Thread(target=self._run, daemon=True)
@@ -50,8 +60,13 @@ class CameraStream:
     def unsubscribe(self, queue) -> None:
         with self._lock:
             self._subscribers.discard(queue)
+            self._collector_subscribers.discard(queue)
             if not self._subscribers:
                 self._stop.set()
+
+    def has_real_viewer(self) -> bool:
+        with self._lock:
+            return len(self._subscribers) > len(self._collector_subscribers)
 
     def _run(self) -> None:
         cam = camera_db.get_camera_connection(self.camera_id)
@@ -92,7 +107,7 @@ class CameraStream:
                     try:
                         if self._face_pipeline is None:
                             self._face_pipeline = get_pipeline(self.camera_id)
-                        self._face_pipeline.feed_frame(frame)
+                        self._face_pipeline.feed_frame(frame, has_viewer=self.has_real_viewer())
                     except Exception:
                         log.exception(
                             "camera %s: face pipeline failed, disabling face recognition for this stream",

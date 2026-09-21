@@ -30,6 +30,15 @@ export default function FaceTraining() {
 
   const [undoNotice, setUndoNotice] = useState("");
 
+  // Model training history — see /training-history. Purely informational
+  // here (viewing it never triggers training); retraining only ever
+  // happens via the explicit `python -m app.train_faces` command.
+  const [trainingHistory, setTrainingHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+  useEffect(() => {
+    api.getTrainingHistory(10).then(setTrainingHistory).catch(() => {});
+  }, []);
+
   const loadNext = useCallback(async () => {
     try {
       const data = await api.getNextTrainingCapture();
@@ -182,9 +191,48 @@ export default function FaceTraining() {
     }
   }
 
+  const latestRun = trainingHistory[0];
+
   return (
     <div className="min-h-screen bg-[#0f1016] text-white flex flex-col items-center justify-center px-4 py-10 gap-6">
       <p className="text-xs font-semibold tracking-widest text-slate-400 uppercase">Face dataset labeling</p>
+
+      {latestRun && (
+        <div className="w-full max-w-sm rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-xs">
+          <div className="flex items-center justify-between">
+            <p className="font-semibold text-slate-200">Face Model Training</p>
+            <button onClick={() => setShowHistory((s) => !s)} className="text-brand-400 hover:text-brand-300">
+              {showHistory ? "Hide history" : "Show history"}
+            </button>
+          </div>
+          <p className="text-slate-400 mt-1">
+            Current validation accuracy:{" "}
+            <span className="text-white font-semibold">
+              {latestRun.validation_accuracy != null ? `${(latestRun.validation_accuracy * 100).toFixed(1)}%` : "n/a"}
+            </span>{" "}
+            ({latestRun.sample_count} samples, {latestRun.class_count} employees)
+          </p>
+          <p className="text-slate-500 mt-0.5">
+            Held-out validation only — not a measurement of live-camera accuracy. Retrain from the terminal:{" "}
+            <code className="text-slate-400">python -m app.train_faces</code>
+          </p>
+          {showHistory && (
+            <ul className="mt-2 space-y-1 border-t border-white/10 pt-2">
+              {trainingHistory.map((run, i) => (
+                <li key={run.id} className="flex justify-between text-slate-400">
+                  <span>
+                    Run {trainingHistory.length - i} · {new Date(run.trained_at * 1000).toLocaleDateString()}
+                  </span>
+                  <span className="text-slate-300">
+                    {run.validation_accuracy != null ? `${(run.validation_accuracy * 100).toFixed(1)}%` : "n/a"} ·{" "}
+                    {run.sample_count} samples
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {/* Existing roster only (see GET /api/faces/training/employees) — a
           convenience for finding an ID, never a suggestion of who this is.
