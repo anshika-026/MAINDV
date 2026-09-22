@@ -52,6 +52,7 @@ from ultralytics import YOLO
 import insightface
 
 from app import face_db
+from app import employee_directory
 
 log = logging.getLogger("face_pipeline")
 
@@ -740,10 +741,19 @@ class CameraFacePipeline:
             if pstate.current_identity and (now - pstate.last_recognized_time) <= IDENTITY_GRACE_SECONDS:
                 display_identity = pstate.current_identity
 
+            # name/color resolved from employee_directory.py, keyed by
+            # employee_id only — never changes tracking/identity logic
+            # above, just what's attached to the already-decided ID for
+            # display. None name -> frontend shows "Person"/neutral color,
+            # never a guessed company.
+            name, color = employee_directory.get_display(display_identity)
+
             live_this_frame.append({
                 "track_id": track_id,
                 "bbox": list(pstate.bbox),
                 "employee_id": display_identity,  # None -> frontend shows "Person", never "Unknown"
+                "name": name,
+                "color": color,
                 "confidence": pstate.identity_confidence if display_identity else 0.0,
             })
 

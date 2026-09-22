@@ -39,7 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app import auth, camera_db, face_collection, face_db, face_training_scheduler
+from app import auth, camera_db, employee_directory, face_collection, face_db, face_training_scheduler
 from app.face_pipeline import (
     CLASSIFIER_PATH,
     MAX_CAPTURES_PER_CAMERA,
@@ -306,6 +306,13 @@ def sync_employees():
     leave the old one stuck in the labeling datalist forever. Guarded
     against a malformed/partial response wiping the roster: only prunes if
     the external service actually returned at least one ID.
+
+    For any employee_id also listed in employee_directory.py, that
+    directory's name always wins over whatever this external service
+    reports — it has had known-wrong/misspelled names in the past (e.g.
+    037 as "Shyam" instead of "Shams") and there's no update API on it to
+    fix at the source, so the correction has to be reapplied here on every
+    sync rather than getting silently overwritten again.
     """
     try:
         with urllib.request.urlopen(EXTERNAL_FACES_API, timeout=10) as resp:
@@ -321,7 +328,9 @@ def sync_employees():
         if not employee_id:
             skipped_no_id += 1
             continue
-        face_db.upsert_employee(employee_id, r.get("name", employee_id))
+        corrected = employee_directory.get_employee(employee_id)
+        name = corrected["name"] if corrected else r.get("name", employee_id)
+        face_db.upsert_employee(employee_id, name)
         current_ids.add(employee_id)
         imported += 1
 

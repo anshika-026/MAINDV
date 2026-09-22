@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { WS_HOST, WS_PROTOCOL } from "../api/client";
 
-// One consistent color for every person box/label, recognized or not —
-// box, "Person" text, and a recognized name are all this same blue. No
-// green/amber/red split, no "Unknown" anywhere (see face_pipeline.py's
-// PersonTrackState: a person with no confident identity is still a real,
-// continuously-tracked person, just without a name attached yet).
-const PERSON_BOX_COLOR = "#2563eb";
+// Box color is company-based, resolved server-side from the recognized
+// employee_id (see employee_directory.py) and sent as det.color on every
+// detection. This is only the fallback for an unrecognized person (no
+// employee_id) or a detection sent by a backend that predates the "color"
+// field — kept visually distinct from every company color so it's never
+// mistaken for one. Never a guessed company. No "Unknown" anywhere (see
+// face_pipeline.py's PersonTrackState: a person with no confident identity
+// is still a real, continuously-tracked person, just without a name
+// attached yet).
+const NEUTRAL_BOX_COLOR = "#6b7280";
 
 // Draws one PERSON's box (backend already sends the full body box, not a
 // face box — see face_pipeline.py's _update_person_overlay) + a compact
@@ -17,8 +21,9 @@ const PERSON_BOX_COLOR = "#2563eb";
 // canvas itself is stretched via CSS.
 function drawDetection(ctx, det) {
   const [x1, y1, x2, y2] = det.bbox;
+  const color = det.employee_id ? det.color || NEUTRAL_BOX_COLOR : NEUTRAL_BOX_COLOR;
   ctx.lineWidth = Math.max(2, (x2 - x1) * 0.01);
-  ctx.strokeStyle = PERSON_BOX_COLOR;
+  ctx.strokeStyle = color;
   ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
   // Plain name (or "Person") — no confidence percentage or extra text, to
@@ -29,7 +34,7 @@ function drawDetection(ctx, det) {
   const textWidth = ctx.measureText(label).width;
   const labelHeight = 18;
   const labelY = y1 - labelHeight >= 0 ? y1 - labelHeight : y1;
-  ctx.fillStyle = PERSON_BOX_COLOR;
+  ctx.fillStyle = color;
   ctx.fillRect(x1, labelY, textWidth + padding * 2, labelHeight);
   ctx.fillStyle = "#ffffff";
   ctx.fillText(label, x1 + padding, labelY + labelHeight - 5);
