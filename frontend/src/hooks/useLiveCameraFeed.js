@@ -12,6 +12,38 @@ import { WS_HOST, WS_PROTOCOL } from "../api/client";
 // attached yet).
 const NEUTRAL_BOX_COLOR = "#6b7280";
 
+// One-off display exception, requested for employee 026 (Mahesh
+// Chaudhary) specifically: his box border is split per-side instead of
+// the normal single company color. Purely a rendering choice — his
+// company/label color (still resolved from det.color, same as everyone
+// else) is untouched, only which color each border segment uses.
+const MAHESH_EMPLOYEE_ID = "026";
+const MAHESH_BORDER_COLORS = { top: "#000000", right: "#2563eb", bottom: "#000000", left: "#f97316" };
+
+// Draws a rectangle as four independently-colored line segments rather
+// than one strokeRect() — still one continuous box, just each side its
+// own color. `lineCap = "square"` extends each segment half a line-width
+// past its endpoint, which is what makes adjoining sides meet cleanly at
+// the corners instead of leaving a notch (butt-capped segments don't
+// cover the corner pixels where two colors meet).
+function drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth) {
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = "square";
+  const sides = [
+    [x1, y1, x2, y1, MAHESH_BORDER_COLORS.top],
+    [x2, y1, x2, y2, MAHESH_BORDER_COLORS.right],
+    [x2, y2, x1, y2, MAHESH_BORDER_COLORS.bottom],
+    [x1, y2, x1, y1, MAHESH_BORDER_COLORS.left],
+  ];
+  for (const [sx1, sy1, sx2, sy2, sideColor] of sides) {
+    ctx.strokeStyle = sideColor;
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+  }
+}
+
 // Draws one PERSON's box (backend already sends the full body box, not a
 // face box — see face_pipeline.py's _update_person_overlay) + a compact
 // name-or-"Person" label directly onto the video canvas, in the same pixel
@@ -22,9 +54,14 @@ const NEUTRAL_BOX_COLOR = "#6b7280";
 function drawDetection(ctx, det) {
   const [x1, y1, x2, y2] = det.bbox;
   const color = det.employee_id ? det.color || NEUTRAL_BOX_COLOR : NEUTRAL_BOX_COLOR;
-  ctx.lineWidth = Math.max(2, (x2 - x1) * 0.01);
-  ctx.strokeStyle = color;
-  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  const lineWidth = Math.max(2, (x2 - x1) * 0.01);
+  if (det.employee_id === MAHESH_EMPLOYEE_ID) {
+    drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth);
+  } else {
+    ctx.lineWidth = lineWidth;
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  }
 
   // Plain name (or "Person") — no confidence percentage or extra text, to
   // stay a compact label rather than a UI badge.

@@ -1,14 +1,44 @@
 import asyncio
 import logging
+import os
+
+# Must be set before numpy/torch/onnxruntime get imported (transitively, by
+# face_pipeline below) to take effect. Each of the 3 concurrent camera
+# threads runs its own YOLO/InsightFace inference calls against the same
+# shared model instances (see face_pipeline.CameraFacePipeline's
+# class-level _yolo/_yolo_person/_arcface); left at their library default,
+# each call tries to use every CPU core, so 3 cameras running "at once"
+# means 3x oversubscription fighting itself for the same 8 cores rather
+# than 3 cameras actually running in parallel. Capping per-call threads
+# lets the OS scheduler give each camera's thread a fair, non-thrashing
+# share instead. Measured: this machine's backend process was pinned at
+# ~540% CPU (of 8 cores) with live video down to ~0.4 fps against an 8 fps
+# target before this change.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import auth, camera_db, camera_stream, config, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
+import cv2
+
+from . import auth, camera_db, camera_stream, config, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
 from . import face_routes, face_training_routes, license_routes
 
 logging.basicConfig(level=logging.INFO)
+
+# Same oversubscription fix as the OMP/BLAS env vars above, for OpenCV's
+# own internal parallelism (JPEG decode/encode, resize) — otherwise each of
+# the 3 camera threads' cv2 calls also each try to claim every core.
+cv2.setNumThreads(2)
+try:
+    import torch
+
+    torch.set_num_threads(2)
+except ImportError:
+    pass
 
 app = FastAPI(title="Deco Vision API")
 
@@ -318,11 +348,22 @@ async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None 
             if pipeline is not None:
                 for det in pipeline.get_live_detections():
                     emp_id = det["employee_id"]
+                    # Color is resolved from employee_id -> company via
+                    # employee_directory.py, never guessed from the display
+                    # name. This dict is rebuilt field-by-field from
+                    # get_live_detections() rather than forwarded as-is, so
+                    # "color" (and face_pipeline.py's own "name") were
+                    # previously dropped here even though face_pipeline.py
+                    # already computed them — that's what made every box
+                    # render in the frontend's gray fallback regardless of
+                    # employee_id.
+                    _, color = employee_directory.get_display(emp_id)
                     people.append({
                         "track_id": det["track_id"],
                         "bbox": det["bbox"],
                         "employee_id": emp_id,
                         "name": _employee_display_name(emp_id) if emp_id else None,
+                        "color": color,
                         "confidence": det["confidence"],
                     })
             await websocket.send_json({"people": people, "fire_smoke": []})

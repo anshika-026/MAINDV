@@ -155,22 +155,40 @@ def _check_once() -> None:
     if not enabled:
         return
 
-    last_trained_at = _last_trained_at()
+    last_run = _last_run()
+    last_trained_at = last_run["trained_at"] if last_run else 0.0
     new_labeled = face_db.count_labeled_since(last_trained_at)
     if new_labeled == 0:
         return  # nothing new at all — never retrain on zero new data
 
     time_since = time.time() - last_trained_at if last_trained_at else float("inf")
-    should_train = new_labeled >= MIN_NEW_LABELED or time_since >= MAX_INTERVAL_SECONDS
+    over_max_interval = time_since >= MAX_INTERVAL_SECONDS
+    should_train = new_labeled >= MIN_NEW_LABELED or over_max_interval
     if not should_train:
         return
 
-    cpu = psutil.cpu_percent(interval=1)
-    if cpu >= CPU_PAUSE_PERCENT:
-        with _lock:
-            _state["last_skip_reason"] = f"deferred — system CPU at {cpu:.0f}% (>= {CPU_PAUSE_PERCENT:.0f}% threshold)"
-        log.info("auto-train: deferring this cycle, CPU at %.0f%%", cpu)
-        return
+    # MAX_INTERVAL_SECONDS is meant as an absolute staleness ceiling, not
+    # just another optional trigger alongside MIN_NEW_LABELED. On a box
+    # whose live cameras keep CPU chronically high (3+ concurrent
+    # detection pipelines can pin every core continuously), the CPU-pause
+    # check below would otherwise defer every single cycle forever, and
+    # the classifier would never update no matter how much labeled data
+    # piles up — exactly what happened here: 1600+ labeled corrections
+    # sat unused for ~2 days because CPU never once dropped under the
+    # pause threshold. Once time_since is already past that ceiling,
+    # train anyway rather than keep deferring — a few extra seconds of
+    # CPU contention beats a classifier that silently never learns new
+    # corrections. The CPU pause still applies normally to the
+    # MIN_NEW_LABELED-only trigger, which is the case it was meant for
+    # (yield to a busy live pipeline for a burst of new labels that can
+    # easily wait for the next check).
+    if not over_max_interval:
+        cpu = psutil.cpu_percent(interval=1)
+        if cpu >= CPU_PAUSE_PERCENT:
+            with _lock:
+                _state["last_skip_reason"] = f"deferred — system CPU at {cpu:.0f}% (>= {CPU_PAUSE_PERCENT:.0f}% threshold)"
+            log.info("auto-train: deferring this cycle, CPU at %.0f%%", cpu)
+            return
 
     _run_training_once()
 

@@ -281,6 +281,23 @@ PERSON_TRACK_MAX_AGE = int(os.environ.get("PERSON_TRACK_MAX_AGE", "45"))
 # as two tracks immediately instead of briefly folding one into the other.
 PERSON_TRACKER_MATCH_THRESHOLD = float(os.environ.get("PERSON_TRACKER_MATCH_THRESHOLD", "0.6"))
 
+# When ByteTrack fails to match a moving person to their existing track
+# (their box moved further than PERSON_TRACKER_MATCH_THRESHOLD allows
+# between the infrequent PERSON_DETECT_INTERVAL_FRAMES samples), it hands
+# them a brand-new tracker_id rather than losing them — but the OLD
+# tracker_id's PersonTrackState doesn't know that happened, so it keeps
+# showing its last-known (now stale) box for the rest of PERSON_TRACK_MAX_AGE
+# (~15s) alongside the new track's box: two boxes trailing one moving
+# person. If a just-appeared new track's box overlaps an existing but
+# no-longer-matched ("coasting") track's last-known box by at least this
+# IoU, _update_person_overlay treats it as that same handoff and drops the
+# old track immediately instead of waiting out its grace period. Two
+# genuinely distinct people never trigger this: both would be matched
+# (i.e. NOT coasting) in the same frame, since real ByteTrack overlap
+# between two different simultaneous people needing this exact handoff
+# path is not the failure mode this covers.
+PERSON_TRACK_HANDOFF_IOU = float(os.environ.get("PERSON_TRACK_HANDOFF_IOU", "0.4"))
+
 # How long a committed identity stays displayed after face recognition last
 # confirmed it, before the label falls back to the plain "Person" state —
 # the "short temporal grace period" that stops the name flickering the
@@ -717,6 +734,22 @@ class CameraFacePipeline:
         track_ids_this_frame = list(seen_this_frame.keys())
         boxes_this_frame = [seen_this_frame[tid] for tid in track_ids_this_frame]
         face_assignments = self._faces_by_person(boxes_this_frame, face_detections)
+
+        # ID-handoff cleanup — see PERSON_TRACK_HANDOFF_IOU. Only ever
+        # compares a track_id ByteTrack did NOT match this frame ("coasting"
+        # on its grace period, i.e. not in seen_this_frame) against one that
+        # just appeared for the first time; two people simultaneously
+        # matched this same frame are never touched here.
+        new_track_ids = [tid for tid in track_ids_this_frame if tid not in self.person_tracks]
+        if new_track_ids:
+            coasting_ids = [tid for tid in self.person_tracks if tid not in seen_this_frame]
+            for new_tid in new_track_ids:
+                new_box = np.array(seen_this_frame[new_tid], dtype=np.float32)
+                for old_tid in coasting_ids:
+                    if self._iou(new_box, np.array(self.person_tracks[old_tid].bbox, dtype=np.float32)) >= PERSON_TRACK_HANDOFF_IOU:
+                        del self.person_tracks[old_tid]
+                        coasting_ids.remove(old_tid)
+                        break
 
         for idx, track_id in enumerate(track_ids_this_frame):
             pstate = self.person_tracks.setdefault(track_id, PersonTrackState(track_id=track_id))

@@ -3,6 +3,7 @@ fans them out to however many websocket viewers are currently watching that
 camera, so N browser tabs on the same camera share one RTSP connection
 instead of each opening their own to the NVR."""
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -46,6 +47,19 @@ class CameraStream:
         self._stop = threading.Event()
         self._face_pipeline = None
         self._face_pipeline_failed = False
+        # feed_frame() runs YOLO/InsightFace inference — easily slower than
+        # the video loop's own frame interval under load. Runs on this
+        # single-worker executor instead of inline so a slow detection pass
+        # only ever delays detection, never the raw video frame this same
+        # loop iteration already decoded and is about to broadcast. One
+        # worker + the busy check below means at most one feed_frame() call
+        # in flight per camera; a frame arriving while it's still running is
+        # simply not sent to detection this cycle (SAMPLE_FPS-style
+        # throttling already assumes/allows that), not queued up behind it.
+        self._pipeline_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"face-pipeline-{camera_id}"
+        )
+        self._pipeline_future: concurrent.futures.Future | None = None
 
     def subscribe(self, queue, is_collector: bool = False) -> None:
         with self._lock:
@@ -67,6 +81,22 @@ class CameraStream:
     def has_real_viewer(self) -> bool:
         with self._lock:
             return len(self._subscribers) > len(self._collector_subscribers)
+
+    def _feed_pipeline(self, frame, has_viewer: bool) -> None:
+        """Runs on _pipeline_executor's worker thread, never on the video
+        loop's own thread — see the submit() call in _run(). Same
+        never-take-down-the-video-broadcast contract as before: a missing
+        model file or any other pipeline error logs once and disables face
+        recognition for the rest of this stream's lifetime rather than
+        retrying every frame."""
+        try:
+            self._face_pipeline.feed_frame(frame, has_viewer=has_viewer)
+        except Exception:
+            log.exception(
+                "camera %s: face pipeline failed, disabling face recognition for this stream",
+                self.camera_id,
+            )
+            self._face_pipeline_failed = True
 
     def _run(self) -> None:
         cam = camera_db.get_camera_connection(self.camera_id)
@@ -98,22 +128,17 @@ class CameraStream:
 
                 # Face detection/tracking/recognition, fed off the same
                 # frame the live view already reads — no second RTSP
-                # connection. Deliberately isolated with its own try/except:
-                # a missing model file or any other pipeline error must
-                # never take down the live video broadcast below, so on
-                # first failure it logs once and stays off for the rest of
-                # this stream's lifetime instead of retrying every frame.
-                if not self._face_pipeline_failed:
-                    try:
-                        if self._face_pipeline is None:
-                            self._face_pipeline = get_pipeline(self.camera_id)
-                        self._face_pipeline.feed_frame(frame, has_viewer=self.has_real_viewer())
-                    except Exception:
-                        log.exception(
-                            "camera %s: face pipeline failed, disabling face recognition for this stream",
-                            self.camera_id,
-                        )
-                        self._face_pipeline_failed = True
+                # connection. Submitted to _pipeline_executor (see __init__)
+                # rather than called inline: this keeps a slow/backed-up
+                # detection pass from ever delaying the video encode+
+                # broadcast below. Skipped (not queued) if the previous call
+                # is still running.
+                if not self._face_pipeline_failed and (self._pipeline_future is None or self._pipeline_future.done()):
+                    if self._face_pipeline is None:
+                        self._face_pipeline = get_pipeline(self.camera_id)
+                    self._pipeline_future = self._pipeline_executor.submit(
+                        self._feed_pipeline, frame, self.has_real_viewer()
+                    )
 
                 ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:
