@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+websockets
+python-dotenv
+ultralytics
+# ultralytics' ByteTrack integration (peopleid_tracker.py's PersonBodyTracker,
+# shared by the Re-ID engine) needs `lap` for its Hungarian-algorithm
+# assignment step but doesn't declare it as a hard dependency - without it,
+# ultralytics silently shells out to pip to install it at first .track()
+# call, which fails hard on a box with no outbound internet at runtime.
+lap
+# torchreid's own packaging doesn't declare its real runtime deps (gdown for
+# fetching pretrained weights, tensorboard imported eagerly by its training
+# Engine even though reid_embedding.py never uses it) - pinned here
+# explicitly since `pip install torchreid` alone fails at import time
+# without them.
+torchreid
+gdown
+tensorboard
+pytest
