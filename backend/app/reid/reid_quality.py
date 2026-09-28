@@ -78,6 +78,14 @@ def assess(frame_bgr: np.ndarray, bbox: list[float], det_score: float, quality_m
     # rather than hard-rejecting a legitimately close/cropped frame.
     aspect_ratio = box_h / box_w
     result.aspect_score = _clamp01((aspect_ratio - 0.6) / 1.4)
+    # Hard floor on top of the soft score above: at an entry gate people
+    # walk through upright, so a squat box is someone seated nearby, a
+    # head/shoulders-only crop, or two people merged. Measured on the live
+    # Entry camera, those crops were 26% of enrolled snapshots and a main
+    # source of one person being split into several identities.
+    if aspect_ratio < config.REID_MIN_ASPECT_RATIO:
+        result.reject_reason = "not_upright"
+        return result
 
     crop = frame_bgr[y1:y2, x1:x2]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)

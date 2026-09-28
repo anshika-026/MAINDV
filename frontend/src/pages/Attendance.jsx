@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Calendar, MapPin, Search } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Calendar, Search } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
@@ -8,16 +8,30 @@ import Modal from "../components/Modal";
 import SidePanel from "../components/SidePanel";
 import Avatar from "../components/Avatar";
 import * as api from "../api/client";
-import { attendanceMeta, departments, statusFilters } from "../data/attendanceExtra";
+// Real attendance, marked from face recognition (backend/app/attendance.py).
+const ALL_COMPANIES = "All companies";
+const statusFilters = ["All statuses", "Present", "On site", "Absent", "On Leave"];
+const REFRESH_MS = 30000;
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function displayDateOf(iso) {
+  return new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
 
 export default function Attendance() {
   const [rows, setRows] = useState([]);
   const [stats, setStats] = useState(null);
-  const [department, setDepartment] = useState(departments[0]);
+  const [department, setDepartment] = useState(ALL_COMPANIES);
+  const [error, setError] = useState("");
+  const [history, setHistory] = useState([]);
   const [status, setStatus] = useState(statusFilters[0]);
   const [search, setSearch] = useState("");
   const [dateOpen, setDateOpen] = useState(false);
-  const [date, setDate] = useState("2026-08-30");
+  const [date, setDate] = useState(todayIso);
 
   const [selected, setSelected] = useState(null);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -26,12 +40,46 @@ export default function Attendance() {
   const [leaveForm, setLeaveForm] = useState({ employee: "", from: "", to: "", reason: "" });
   const [toast, setToast] = useState("");
 
+  const load = useCallback(() => {
+    api
+      .getAttendanceDay(date)
+      .then((data) => {
+        setRows(
+          data.rows.map((r) => ({
+            id: r.employee_id,
+            date: displayDateOf(data.date),
+            employee: r.name,
+            empId: r.employee_id,
+            department: r.company,
+            timeIn: r.time_in,
+            timeOut: r.time_out,
+            timeStay: r.time_stay,
+            arrival: r.arrival,
+            status: r.status,
+            camera: r.camera,
+            lastSeen: r.last_seen,
+            confidence: r.confidence,
+          }))
+        );
+        setStats(data.stats);
+        setError("");
+      })
+      .catch(() => setError("Couldn't load attendance. Check the backend is running."));
+  }, [date]);
+
   useEffect(() => {
-    api.getAttendance().then((data) =>
-      setRows(data.map((r, i) => ({ ...r, ...(attendanceMeta[i] || {}), id: i })))
-    );
-    api.getAttendanceStats().then(setStats);
-  }, []);
+    load();
+    const t = setInterval(load, REFRESH_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  useEffect(() => {
+    if (!selected) return;
+    setHistory([]);
+    api.getAttendanceHistory(selected.empId).then(setHistory).catch(() => setHistory([]));
+  }, [selected]);
+
+  const companies = useMemo(() => [ALL_COMPANIES, ...new Set(rows.map((r) => r.department))], [rows]);
 
   function showToast(msg) {
     setToast(msg);
@@ -41,7 +89,7 @@ export default function Attendance() {
   const filtered = useMemo(
     () =>
       rows.filter((r) => {
-        if (department !== departments[0] && r.department !== department) return false;
+        if (department !== ALL_COMPANIES && r.department !== department) return false;
         if (status !== statusFilters[0] && r.status !== status) return false;
         if (search && !r.employee.toLowerCase().includes(search.toLowerCase())) return false;
         return true;
@@ -49,27 +97,27 @@ export default function Attendance() {
     [rows, department, status, search]
   );
 
-  const displayDate = new Date(`${date}T00:00:00`).toLocaleDateString(undefined, {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
+  const displayDate = displayDateOf(date);
 
   // Per product notes: HR approves and marks leave externally — this modal
   // just records that decision here so Attendance reflects it directly,
   // instead of that being tracked in a separate spreadsheet.
-  function handleMarkLeave(e) {
+  async function handleMarkLeave(e) {
     e.preventDefault();
-    setRows((prev) =>
-      prev.map((r) =>
-        r.employee === leaveForm.employee
-          ? { ...r, status: "On Leave", timeIn: "-", timeOut: "-", timeStay: "-", arrival: "-" }
-          : r
-      )
-    );
-    showToast(`Leave marked for ${leaveForm.employee}`);
-    setLeaveOpen(false);
-    setLeaveForm({ employee: "", from: "", to: "", reason: "" });
+    const emp = rows.find((r) => r.employee === leaveForm.employee);
+    if (!emp) {
+      showToast("Pick an employee from the list");
+      return;
+    }
+    try {
+      await api.markLeave({ employeeId: emp.empId, from: leaveForm.from, to: leaveForm.to, reason: leaveForm.reason });
+      showToast(`Leave marked for ${leaveForm.employee}`);
+      setLeaveOpen(false);
+      setLeaveForm({ employee: "", from: "", to: "", reason: "" });
+      load();
+    } catch (err) {
+      showToast(err.message.includes("422") ? "The leave dates don't make sense. Check From and To." : "Couldn't save the leave.");
+    }
   }
 
   return (
@@ -85,16 +133,16 @@ export default function Attendance() {
 
       {stats && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard label="People Present" value={`${stats.present} of ${stats.presentOf}`} sub="+2 vs yesterday" />
-          <StatCard label="People Absent" value={stats.absent} subTone="danger" sub="-4 vs yesterday" />
-          <StatCard label="Attendance Percentage" value={stats.attendancePct} sub="+2% vs yesterday" />
-          <StatCard label="Late Arrivals" value={stats.lateArrivals} subTone="danger" sub="-2 vs yesterday" />
+          <StatCard label="People Present" value={`${stats.present} of ${stats.total}`} sub="seen by face recognition" subTone="neutral" />
+          <StatCard label="People Absent" value={stats.absent} subTone="danger" sub={stats.on_leave ? `${stats.on_leave} on leave` : ""} />
+          <StatCard label="Attendance Percentage" value={`${stats.attendance_pct}%`} sub="" />
+          <StatCard label="Late Arrivals" value={stats.late} subTone="danger" sub="" />
         </div>
       )}
 
       <div className="flex flex-wrap items-center gap-3">
         <select value={department} onChange={(e) => setDepartment(e.target.value)} className="input-field w-auto">
-          {departments.map((d) => (
+          {companies.map((d) => (
             <option key={d}>{d}</option>
           ))}
         </select>
@@ -134,6 +182,8 @@ export default function Attendance() {
         </div>
       </div>
 
+      {error && <p className="text-sm text-danger-500">{error}</p>}
+
       {toast && (
         <div className="text-sm text-success-600 bg-success-50 border border-success-500/20 rounded-lg px-3.5 py-2">
           {toast}
@@ -171,32 +221,28 @@ export default function Attendance() {
               <Avatar name={selected.employee} size={48} />
               <div>
                 <p className="font-semibold text-ink-900">{selected.employee}</p>
-                <span className="badge badge-neutral mt-1">{selected.role || "Employee"}</span>
+                <span className="badge badge-neutral mt-1">{selected.department}</span>
               </div>
             </div>
 
             <div className="space-y-2.5 text-sm">
               <p className="flex items-center justify-between">
-                <span className="text-slate-400">Current location</span>
-                <span className="font-medium text-ink-900">{selected.zone}</span>
+                <span className="text-slate-400">Status</span>
+                <StatusBadge value={selected.status} />
               </p>
               <p className="flex items-center justify-between">
-                <span className="text-slate-400">Camera</span>
+                <span className="text-slate-400">Last seen by</span>
                 <span className="font-medium text-ink-900">{selected.camera}</span>
               </p>
               <p className="flex items-center justify-between">
-                <span className="text-slate-400">Last seen on desk</span>
-                <span className="font-medium text-ink-900">{selected.lastSeenDesk}</span>
+                <span className="text-slate-400">Last seen at</span>
+                <span className="font-medium text-ink-900">{selected.lastSeen}</span>
               </p>
               <p className="flex items-center justify-between">
                 <span className="text-slate-400">Confidence</span>
                 <span className="font-medium text-ink-900">{selected.confidence}%</span>
               </p>
             </div>
-
-            <button className="text-brand-600 text-sm font-medium flex items-center gap-1.5">
-              <MapPin size={14} /> Live location →
-            </button>
 
             <button
               onClick={() => setHistoryOpen((o) => !o)}
@@ -217,9 +263,9 @@ export default function Attendance() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(selected.history || []).map((h, i) => (
-                        <tr key={i}>
-                          <td>{h.date}</td>
+                      {history.map((h) => (
+                        <tr key={h.date}>
+                          <td>{displayDateOf(h.date)}</td>
                           <td><StatusBadge value={h.status} /></td>
                         </tr>
                       ))}

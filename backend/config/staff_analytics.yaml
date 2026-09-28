@@ -1,0 +1,33 @@
+# Staff Count analytics (backend/app/staff/). Restart the backend after editing.
+# Per-camera setup (which cameras are entrances, the entry line, the office ROI)
+# is done on the Staff Count page and stored in the database, not here.
+staff_analytics:
+  # --- detection + tracking ---
+  detection_confidence: 0.45     # YOLO person confidence
+  tracker: bytetrack.yaml        # bytetrack.yaml or botsort.yaml (ultralytics)
+  imgsz: 640                     # YOLO input size
+  process_fps: 5                 # frames analysed per second per entrance camera;
+                                 # a walker crosses a door in ~1 s, so keep >= 4
+  track_lost_timeout: 8          # s a track may vanish (occlusion, noise) before it's forgotten.
+                                 # Forgetting a track NEVER counts as an exit.
+
+  # --- entry / exit line ---
+  minimum_crossing_distance: 20  # px: the person must go this far past the line on BOTH sides
+                                 # (a hysteresis band), so standing on it or jitter never fires
+  line_margin: 0.15              # crossings up to this fraction of the line's length beyond
+                                 # its ends still count (people cut corners at doors)
+  crossing_confirm_seconds: 1.0  # s a person must stay on the new side (or vanish there) before
+                                 # the crossing counts; stepping over and straight back = nothing
+  entry_exit_cooldown: 3         # s: no second event for the same track within this
+
+  # --- identity ---
+  recognition_confidence: 0.70   # face classifier probability for a read to count
+  recognition_min_votes: 2       # agreeing reads needed before an identity is trusted
+  identify_attempts_per_cycle: 2 # face reads per camera per processed frame (CPU cap)
+  late_identification_seconds: 10  # a face confirmed this soon after an anonymous ENTRY
+                                   # upgrades that entry to the employee
+  reid_match_threshold: 0.72     # body-appearance similarity to match an exit to someone inside
+  reid_min_margin: 0.05          # ...and it must beat the runner-up by this much
+
+  # --- daily reset ---
+  end_of_day: "23:59"            # everyone still inside is closed with an AUTO_EXIT at this time

@@ -18,14 +18,16 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import cv2
 
 from . import auth, camera_db, camera_stream, config, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
-from . import face_routes, face_training_routes, footfall, footfall_routes, license_routes
+from .staff import routes as staff_routes
+from .staff.service import service as staff_service
+from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -54,14 +56,45 @@ app.include_router(face_routes.router)
 app.include_router(face_training_routes.router)
 app.include_router(license_routes.router)
 app.include_router(footfall_routes.router)
+app.include_router(attendance_routes.router)
+app.include_router(desk_routes.router)
+app.include_router(insights_routes.router)
+app.include_router(alerts_routes.router)
+app.include_router(analytics_routes.router)
+app.include_router(intrusion_routes.router)
+app.include_router(staff_routes.router)
+staff_routes.register_websockets(app, lambda token: auth.get_session(token) is not None)
+
+
+def _enable_wal() -> None:
+    """Attendance, desk analytics, footfall and face-training capture all
+    write to data/app.db through the day, and in SQLite's default rollback
+    mode a reader blocks writers (and vice versa) — which surfaced as
+    "database is locked" on login. WAL lets reads proceed during a write.
+    It's a persistent property of the database file, so this is a no-op
+    after the first run."""
+    import sqlite3
+
+    conn = sqlite3.connect(camera_db.DB_PATH, timeout=30)
+    try:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        logging.getLogger("main").info("database journal mode: %s", mode)
+    finally:
+        conn.close()
 
 
 @app.on_event("startup")
 def on_startup():
+    _enable_wal()
     camera_db.init_db()
+    analytics_settings.init_db()
     face_db.init_face_tables()
     license_db.init_db()
     auth.init_db()
+    attendance.init_db()
+    alerts.init_db()
+    intrusion.init_db()
+    desk_db.init_db()
     # Always start the expiry watcher (cheap, idempotent) so a session
     # started later still gets watched, then resume whatever collection
     # session was running before a restart (if its planned end time hasn't
@@ -77,6 +110,13 @@ def on_startup():
     # Unique footfall across entry gates — keeps every "Entry/Exit" camera
     # streaming and counting, viewer or not. See footfall.py.
     footfall.service.start()
+    # Desk analytics + keeping face-recognition cameras streaming all day.
+    desks.service.start()
+    # Camera-offline / footfall-stopped alert monitor.
+    alerts.start()
+    intrusion.service.start()
+    # Staff Count at entrance cameras (see app/staff/).
+    staff_service.start()
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +175,46 @@ def create_camera(payload: CameraIn, _: dict = Depends(auth.require_admin)):
     return camera_db.get_camera(camera_id)
 
 
+class StreamTestIn(BaseModel):
+    rtsp_url: str
+
+
+@app.post("/api/cameras/test-stream")
+def test_camera_stream(payload: StreamTestIn, _: dict = Depends(auth.require_admin)):
+    """Connects to an RTSP link once and returns a single still (JPEG), so the
+    Add Camera form can show the link works before it's saved. Runs in
+    FastAPI's threadpool (plain def), so a slow camera never blocks others."""
+    url = payload.rtsp_url.strip()
+    if not url.lower().startswith("rtsp://"):
+        raise HTTPException(status_code=422, detail="The link must start with rtsp://")
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000])
+    try:
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Couldn't connect. Check the address, port, username and password.")
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise HTTPException(status_code=400, detail="Connected, but the camera sent no video. Check the stream path.")
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    finally:
+        cap.release()
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id: int, payload: CameraUpdate, _: dict = Depends(auth.require_admin)):
     if camera_db.get_camera(camera_id) is None:
         raise HTTPException(status_code=404, detail="Camera not found")
     fields = payload.model_dump(exclude_unset=True)
     camera_db.update_camera(camera_id, **fields)
+    if "live_feed_enabled" in fields:
+        stream = camera_stream.get_stream(camera_id)
+        stream.resume() if fields["live_feed_enabled"] else stream.stop()
+        # Background keep-alives (footfall, desks, intrusion) pick it up now, not in 15 s.
+        for sync in (footfall.service._sync_gates, desks.service._sync, intrusion.service.sync, staff_service.sync):
+            try:
+                sync()
+            except Exception:
+                pass
     return camera_db.get_camera(camera_id)
 
 
@@ -286,7 +360,7 @@ def _authorize_camera_ws(token: str | None, camera_id: int) -> bool:
 
 
 @app.websocket("/ws/live/{camera_id}")
-async def ws_live(websocket: WebSocket, camera_id: int, token: str | None = None):
+async def ws_live(websocket: WebSocket, camera_id: int, token: str | None = None, plain: bool = False, w: int | None = None):
     await websocket.accept()
     if not _authorize_camera_ws(token, camera_id):
         await websocket.close(code=4401)
@@ -294,6 +368,9 @@ async def ws_live(websocket: WebSocket, camera_id: int, token: str | None = None
     cam = camera_db.get_camera(camera_id)
     if not cam or not cam.get("host"):
         await websocket.close()
+        return
+    if not cam.get("live"):
+        await websocket.close(code=4403, reason="Feed switched off")
         return
 
     loop = asyncio.get_event_loop()
@@ -305,7 +382,12 @@ async def ws_live(websocket: WebSocket, camera_id: int, token: str | None = None
             loop.call_soon_threadsafe(_drop_oldest_and_put, queue, item)
 
     stream = camera_stream.get_stream(camera_id)
-    stream.subscribe(ThreadSafePut)
+    # plain=1 (the plain Live Feed page, no boxes drawn) subscribes like a
+    # background collector, so it doesn't make face_pipeline run the extra
+    # person-overlay detection that only the AI Analytics view displays.
+    # w: send frames scaled to this width (grid tiles ask for 960 px; see
+    # camera_stream's encoding comment for the bandwidth this saves).
+    stream.subscribe(ThreadSafePut, is_collector=plain, width=max(320, min(w, 3840)) if w else None)
     try:
         while True:
             frame = await queue.get()
@@ -370,7 +452,10 @@ async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None 
                         "color": color,
                         "confidence": det["confidence"],
                     })
-            await websocket.send_json({"people": people, "fire_smoke": []})
+            # Boxes are in the camera's full-resolution pixels; the frame
+            # size lets a viewer showing a scaled-down picture place them.
+            fw, fh = pipeline.frame_size if pipeline is not None and pipeline.frame_size else (None, None)
+            await websocket.send_json({"people": people, "fire_smoke": [], "frame_w": fw, "frame_h": fh})
             await asyncio.sleep(0.3)
     except WebSocketDisconnect:
         pass

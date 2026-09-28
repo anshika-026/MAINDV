@@ -70,10 +70,19 @@ def _seed_sites_if_empty(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR IGNORE INTO sites (name, description) VALUES (?, '')", ("Noida Site",))
 
 
+def is_streamable(cam: dict | None) -> bool:
+    """Has an address and its feed is switched on (Camera Management's
+    Live feed switch). A switched-off camera is never connected to: no live
+    view, no analytics, no background streaming."""
+    return bool(cam and cam.get("host") and cam.get("live_feed_enabled", 1))
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["is_configured"] = bool(d["host"])
-    d["live"] = bool(d["live_feed_enabled"]) and d["status"] == "active" and bool(d["host"])
+    d["live"] = is_streamable(d)
+    # Status shown in the UI: a camera whose feed is switched off is inactive.
+    d["status"] = "active" if d["live"] else "inactive"
     d.pop("password", None)  # never sent to the frontend
     return d
 

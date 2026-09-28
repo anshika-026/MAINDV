@@ -92,39 +92,94 @@ export async function signup(payload) {
 }
 
 // ---- Dashboard ---------------------------------------------------------
+// Real: /dashboard/summary (backend/app/insights.py) + footfall. Guests and
+// Guests have no backend yet, so that card says so instead of showing
+// sample numbers.
 export async function getDashboardStats() {
-  // Camera count and footfall are real; the rest (people/alerts/AI
-  // insights) has no backend pipeline yet, so it stays mock.
-  const [cameras, footfall] = await Promise.all([getCameras(), getFootfallSummary().catch(() => null)]);
-  const online = cameras.filter((c) => c.status === "Active").length;
+  const [summary, footfall, alertSummary, staff] = await Promise.all([
+    request("/dashboard/summary"),
+    getFootfallSummary().catch(() => null),
+    getAlertsSummary().catch(() => null),
+    request("/staff/count").catch(() => null),
+  ]);
   const gates = footfall?.gates.length ?? 0;
+  const pp = summary.people_present;
+  const diff = pp.value - pp.yesterday;
   return {
-    ...mock.dashboardStats,
     admin: {
-      ...mock.dashboardStats.admin,
-      camerasOnline: { value: `${online} / ${cameras.length}`, sub: "" },
+      peoplePresent: { value: pp.value, of: pp.of, sub: `${diff >= 0 ? "+" : ""}${diff} vs yesterday` },
       footfallToday: footfall
         ? {
             value: footfall.unique_today,
             sub: gates ? `across ${gates} gate${gates === 1 ? "" : "s"} · avg ${footfall.avg_per_gate}/gate` : "no gate cameras set",
           }
         : { value: "—", sub: "footfall unavailable" },
+      unknownVisitors: { value: summary.unknown_faces, sub: "faces not recognised today" },
+      camerasOnline: {
+        value: `${summary.cameras.online} / ${summary.cameras.total}`,
+        sub: summary.cameras.offline ? `${summary.cameras.offline} offline` : "",
+      },
+      currentStaff: staff
+        ? { value: staff.current_staff_count, sub: `${staff.total_entries_today} in · ${staff.total_exits_today} out today` }
+        : { value: "—", sub: "staff count unavailable" },
+      activeAlerts: alertSummary
+        ? { value: alertSummary.active, sub: alertSummary.acknowledged ? `${alertSummary.acknowledged} acknowledged` : "" }
+        : { value: "—", sub: "alerts unavailable" },
     },
+    needsAttention: summary.needs_attention,
+    aiInsights: summary.insights,
   };
 }
 
 // ---- Alerts & Events -----------------------------------------------------
-export async function getAlerts() {
-  // return request("/alerts");
-  return Promise.resolve(mock.alerts);
+// Real alerts (backend/app/alerts.py): unknown people at gates, cameras
+// offline, footfall stopped, late arrivals. range: today | yesterday | week | all
+function mapAlert(a) {
+  const d = new Date(a.ts * 1000);
+  return {
+    id: a.id,
+    ts: a.ts,
+    date: d.toLocaleDateString(undefined, { day: "numeric", month: "short" }),
+    time: d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    event: a.event,
+    severity: a.severity,
+    status: a.status,
+    camera: a.camera_name,
+    location: a.location,
+    message: a.message,
+    confidence: a.confidence,
+    occurrences: a.occurrences,
+    lastSeen: new Date(a.last_seen * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    hasSnapshot: a.has_snapshot,
+    acknowledgedBy: a.acknowledged_by,
+    resolvedBy: a.resolved_by,
+    resolutionReason: a.resolution_reason,
+  };
+}
+export async function getAlerts(range = "today") {
+  return (await request(`/alerts?range=${range}`)).map(mapAlert);
+}
+// On/off switch per analytics feature + live CPU (backend/app/analytics_settings.py).
+export async function getAnalyticsSettings() {
+  return request("/analytics/settings");
+}
+export async function setAnalyticsFeature(feature, on) {
+  return request(`/analytics/settings/${feature}`, { method: "PUT", body: JSON.stringify({ on }) });
 }
 export async function getAlertsSummary() {
-  // return request("/alerts/summary");
-  return Promise.resolve(mock.alertsSummary);
+  return request("/alerts/summary");
+}
+export async function acknowledgeAlert(id) {
+  return request(`/alerts/${id}/acknowledge`, { method: "POST" });
 }
 export async function resolveAlert(id, reason) {
-  // return request(`/alerts/${id}/resolve`, { method: "POST", body: JSON.stringify({ reason }) });
-  return Promise.resolve({ ok: true });
+  return request(`/alerts/${id}/resolve`, { method: "POST", body: JSON.stringify({ reason }) });
+}
+export async function fetchAlertSnapshotObjectUrl(id) {
+  const res = await fetch(`${BASE_URL}/alerts/${id}/snapshot`, { headers: { ...authHeaders() } });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) throw new Error("No snapshot");
+  return URL.createObjectURL(await res.blob());
 }
 // ---- Cameras / Sites -----------------------------------------------------
 
@@ -169,6 +224,7 @@ function mapCamera(c) {
     purpose: c.purpose,
     status: c.status === "active" ? "Active" : "Inactive",
     live: c.live_feed_enabled ? "On" : "Off",
+    feedOn: !!c.live,
     isConfigured: c.is_configured,
     // Raw fields needed to reconstruct a (password-blank) stream URL and
     // populate the Edit Camera form — password itself is never sent here.
@@ -185,15 +241,36 @@ export async function getCameras() {
   return cameras.map(mapCamera);
 }
 export async function addCamera(payload) {
+  // payload.streamUrl is a full rtsp:// link; split into the fields the
+  // backend stores (password included — it's only ever sent, never read back).
+  const s = payload.streamUrl ? parseRtspUrl(payload.streamUrl) : null;
   return request("/cameras", {
     method: "POST",
     body: JSON.stringify({
       name: payload.driveName,
       site: payload.site,
-      cam_code: payload.code,
+      cam_code: payload.code || "",
       purpose: payload.purpose || "GENERAL",
+      ...(s && { host: s.host, port: s.port, user: s.user, password: s.password, stream_path: s.streamPath }),
+      attendance_tracking: payload.attendanceTracking ?? true,
+      live_feed_enabled: true,
     }),
   });
+}
+// Connects to an RTSP link once and returns an object URL of one still, or
+// throws with the backend's explanation (bad address, login, stream path).
+export async function testCameraStream(rtspUrl) {
+  const res = await fetch(`${BASE_URL}/cameras/test-stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ rtsp_url: rtspUrl }),
+  });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || `Couldn't reach the camera (${res.status})`);
+  }
+  return URL.createObjectURL(await res.blob());
 }
 export async function updateCamera(id, payload) {
   return request(`/cameras/${id}`, { method: "PUT", body: JSON.stringify(payload) });
@@ -271,26 +348,47 @@ export async function getValidatedPeople() {
   return Promise.resolve(mock.validatedPeople);
 }
 // ---- Attendance --------------------------------------------------------
-export async function getAttendance() {
-  // return request("/attendance");
-  return Promise.resolve(mock.attendance);
+// Marked from face recognition on cameras with it switched on
+// (backend/app/attendance.py). `date` is YYYY-MM-DD.
+export async function getAttendanceDay(date) {
+  return request(`/attendance?date=${encodeURIComponent(date)}`);
 }
-export async function getAttendanceStats() {
-  // return request("/attendance/stats");
-  return Promise.resolve(mock.attendanceStats);
+export async function getAttendanceHistory(employeeId, days = 14) {
+  return request(`/attendance/${encodeURIComponent(employeeId)}/history?days=${days}`);
+}
+export async function markLeave({ employeeId, from, to, reason }) {
+  return request("/attendance/leave", {
+    method: "POST",
+    body: JSON.stringify({ employee_id: employeeId, day_from: from, day_to: to, reason }),
+  });
 }
 // ---- Workforce -----------------------------------------------------------
-export async function getWorkforceStats() {
-  // return request("/workforce/stats");
-  return Promise.resolve(mock.workforceStats);
+// Real: attendance, trend and face-enrolment split (backend/app/insights.py).
+export async function getWorkforceOverview(date) {
+  return request(`/workforce/overview${date ? `?date=${date}` : ""}`);
 }
-export async function getWorkforcePeopleAnalytics() {
-  // return request("/workforce/people-analytics");
-  return Promise.resolve(mock.workforcePeopleAnalytics);
+// ---- Desk analytics (real: backend/app/desks.py) --------------------------
+export async function listDeskZones(cameraId) {
+  return request(`/desk-zones${cameraId ? `?camera_id=${cameraId}` : ""}`);
 }
-export async function getDeskAnalytics() {
-  // return request("/workforce/desk-analytics");
-  return Promise.resolve(mock.deskAnalytics);
+export async function createDeskZone(cameraId, polygon, label) {
+  return request("/desk-zones", { method: "POST", body: JSON.stringify({ camera_id: cameraId, polygon, label: label || null }) });
+}
+export async function deleteDeskZone(zoneId) {
+  return request(`/desk-zones/${zoneId}`, { method: "DELETE" });
+}
+export async function getDeskReport(date) {
+  return request(`/desk-analytics/report${date ? `?date=${date}` : ""}`);
+}
+// Latest still from any camera (starts it briefly if it isn't streaming).
+export async function fetchCameraFrameObjectUrl(cameraId) {
+  const res = await fetch(`${BASE_URL}/cameras/${cameraId}/frame`, { headers: { ...authHeaders() } });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || `No picture from this camera (${res.status})`);
+  }
+  return URL.createObjectURL(await res.blob());
 }
 
 // ---- Footfall ------------------------------------------------------------
@@ -300,15 +398,85 @@ export async function getDeskAnalytics() {
 export async function getFootfallSummary() {
   return request("/footfall/summary");
 }
+// UAT panel: every unique person currently counted, and a one-click restart.
+export async function getFootfallPeople() {
+  return request("/footfall/people");
+}
+export async function resetFootfall() {
+  return request("/footfall/reset", { method: "POST" });
+}
+// Counting zone per gate: roi is [[x, y], ...] in 0..1 frame fractions, or
+// null to count the whole frame.
+export async function setFootfallZone(cameraId, roi) {
+  return request(`/footfall/cameras/${cameraId}/zone`, { method: "PUT", body: JSON.stringify({ roi }) });
+}
+export async function fetchFootfallFrameObjectUrl(cameraId) {
+  const res = await fetch(`${BASE_URL}/footfall/cameras/${cameraId}/frame`, { headers: { ...authHeaders() } });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) throw new Error(`No frame from this camera yet (${res.status})`);
+  return URL.createObjectURL(await res.blob());
+}
+// Needs the admin Bearer token, which a plain <img src> cannot send — same
+// reasoning as fetchTrainingImageObjectUrl.
+export async function fetchFootfallSnapshotObjectUrl(snapshotId) {
+  const res = await fetch(`${BASE_URL}/footfall/snapshots/${snapshotId}`, { headers: { ...authHeaders() } });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) throw new Error(`Could not load snapshot (${res.status})`);
+  return URL.createObjectURL(await res.blob());
+}
 
 // ---- Intrusion -----------------------------------------------------------
-export async function getIntrusionZones() {
-  // return request("/intrusion/zones");
-  return Promise.resolve(mock.intrusionZones);
+// Real restricted-area zones (backend/app/intrusion.py). Detections arrive as
+// "Intrusion Detected" alerts.
+export async function getIntrusionZones(cameraId) {
+  return request(`/intrusion/zones${cameraId ? `?camera_id=${cameraId}` : ""}`);
 }
-export async function addZone(payload) {
-  // return request("/intrusion/zones", { method: "POST", body: JSON.stringify(payload) });
-  return Promise.resolve({ ok: true });
+export async function createIntrusionZone({ cameraId, name, polygon, from, to }) {
+  return request("/intrusion/zones", {
+    method: "POST",
+    body: JSON.stringify({ camera_id: cameraId, name, polygon, active_from: from || null, active_to: to || null }),
+  });
+}
+export async function updateIntrusionZone(id, fields) {
+  return request(`/intrusion/zones/${id}`, { method: "PATCH", body: JSON.stringify(fields) });
+}
+export async function deleteIntrusionZone(id) {
+  return request(`/intrusion/zones/${id}`, { method: "DELETE" });
+}
+export async function getIntrusionStats() {
+  return request("/intrusion/stats");
+}
+
+// ---- Staff Count (backend/app/staff/) -------------------------------------
+// Occupancy from entry/exit line crossings at entrance cameras; the count is
+// the backend's occupancy state, never the number of people in a frame.
+export async function getStaffCount() {
+  return request("/staff/count");
+}
+export async function getStaffPresent() {
+  return request("/staff/present");
+}
+export async function getStaffEvents(limit = 100) {
+  return request(`/staff/events?limit=${limit}`);
+}
+export async function getStaffCameras() {
+  return request("/staff/cameras");
+}
+export async function getStaffStatus() {
+  return request("/staff/status");
+}
+export async function setStaffCameraConfig(cameraId, { enabled, line, insideSign, roi }) {
+  return request(`/staff/cameras/${cameraId}/config`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled, line, inside_sign: insideSign, roi: roi && roi.length ? roi : null }),
+  });
+}
+export async function resetStaffOccupancy() {
+  return request("/staff/reset", { method: "POST", body: JSON.stringify({ reason: "manual reset" }) });
+}
+export function staffSocketUrl(path) {
+  const token = localStorage.getItem("deco_token") || "";
+  return `${WS_PROTOCOL}://${WS_HOST}${path}?token=${encodeURIComponent(token)}`;
 }
 
 // ---- Settings ------------------------------------------------------------

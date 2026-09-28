@@ -51,10 +51,13 @@ function drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth) {
 // feeds face_pipeline the exact frame it also JPEG-encodes for /ws/live —
 // no resizing in between), so this needs no scaling math even though the
 // canvas itself is stretched via CSS.
-function drawDetection(ctx, det) {
+// `k` undoes the canvas scale for text and line sizes: boxes are drawn in the
+// camera's full-resolution pixels (the canvas is scaled to fit a smaller
+// picture), but labels should stay the same readable size either way.
+function drawDetection(ctx, det, k = 1) {
   const [x1, y1, x2, y2] = det.bbox;
   const color = det.employee_id ? det.color || NEUTRAL_BOX_COLOR : NEUTRAL_BOX_COLOR;
-  const lineWidth = Math.max(2, (x2 - x1) * 0.01);
+  const lineWidth = Math.max(2 * k, (x2 - x1) * 0.01);
   if (det.employee_id === MAHESH_EMPLOYEE_ID) {
     drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth);
   } else {
@@ -66,15 +69,15 @@ function drawDetection(ctx, det) {
   // Plain name (or "Person") — no confidence percentage or extra text, to
   // stay a compact label rather than a UI badge.
   const label = det.employee_id ? det.name || det.employee_id : "Person";
-  ctx.font = "600 13px sans-serif";
-  const padding = 4;
+  ctx.font = `600 ${13 * k}px sans-serif`;
+  const padding = 4 * k;
   const textWidth = ctx.measureText(label).width;
-  const labelHeight = 18;
+  const labelHeight = 18 * k;
   const labelY = y1 - labelHeight >= 0 ? y1 - labelHeight : y1;
   ctx.fillStyle = color;
   ctx.fillRect(x1, labelY, textWidth + padding * 2, labelHeight);
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(label, x1 + padding, labelY + labelHeight - 5);
+  ctx.fillText(label, x1 + padding, labelY + labelHeight - 5 * k);
 }
 
 // Opens the backend's per-camera live-view websocket (camera_stream.py) and
@@ -86,14 +89,22 @@ function drawDetection(ctx, det) {
 // person-first architecture). Shared by the grid tile and the enlarged
 // viewer modal so both draw from their own independent connections using
 // identical wiring.
-export default function useLiveCameraFeed(camera) {
+// Pass { overlay: false } for plain video: no detections websocket, and the
+// live socket asks the backend not to run overlay detection for this viewer.
+// width: ask the backend for frames scaled to this many pixels wide (grid
+// tiles use 960, ~4x less bandwidth than full HD); omit for full resolution.
+export default function useLiveCameraFeed(camera, { overlay = true, width } = {}) {
   const canvasRef = useRef(null);
-  const [status, setStatus] = useState(camera?.isConfigured ? "connecting" : "offline");
-  const detectionsRef = useRef([]); // latest detections, redrawn on top of every new frame
+  const [status, setStatus] = useState(camera?.isConfigured && camera?.feedOn !== false ? "connecting" : "offline");
+  const detectionsRef = useRef({ people: [], frameW: null }); // latest detections, redrawn on every frame
 
   useEffect(() => {
     if (!camera?.isConfigured) {
       setStatus("offline");
+      return;
+    }
+    if (camera.feedOn === false) {
+      setStatus("disabled");
       return;
     }
 
@@ -105,7 +116,14 @@ export default function useLiveCameraFeed(camera) {
     function redraw() {
       if (!img.width) return;
       ctx.drawImage(img, 0, 0);
-      for (const det of detectionsRef.current) drawDetection(ctx, det);
+      // Boxes arrive in the camera's full-resolution pixels; scale them to
+      // the (possibly smaller) picture being shown.
+      const { people, frameW } = detectionsRef.current;
+      const scale = frameW ? img.width / frameW : 1;
+      ctx.save();
+      ctx.scale(scale, scale);
+      for (const det of people) drawDetection(ctx, det, 1 / scale);
+      ctx.restore();
     }
 
     // Browsers can't attach an Authorization header to a WebSocket
@@ -115,7 +133,7 @@ export default function useLiveCameraFeed(camera) {
     // expired, or doesn't own this camera.
     const token = localStorage.getItem("deco_token") || "";
     const ws = new WebSocket(
-      `${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}?token=${encodeURIComponent(token)}`
+      `${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}?token=${encodeURIComponent(token)}${overlay ? "" : "&plain=1"}${width ? `&w=${width}` : ""}`
     );
     ws.binaryType = "blob";
     ws.onopen = () => setStatus("live");
@@ -136,26 +154,28 @@ export default function useLiveCameraFeed(camera) {
 
     // Best-effort: if this fails to connect for any reason, the video feed
     // above still works — this only adds the overlay on top of it.
-    const detWs = new WebSocket(
-      `${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}?token=${encodeURIComponent(token)}`
-    );
-    detWs.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        detectionsRef.current = data.people || [];
-      } catch {
-        // malformed payload — keep showing the last good overlay
-      }
-      redraw();
-    };
-    detWs.onerror = () => {};
+    const detWs = overlay
+      ? new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}?token=${encodeURIComponent(token)}`)
+      : null;
+    if (detWs) {
+      detWs.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          detectionsRef.current = { people: data.people || [], frameW: data.frame_w || null };
+        } catch {
+          // malformed payload — keep showing the last good overlay
+        }
+        redraw();
+      };
+      detWs.onerror = () => {};
+    }
 
     return () => {
       ws.close();
-      detWs.close();
+      detWs?.close();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [camera?.id, camera?.isConfigured]);
+  }, [camera?.id, camera?.isConfigured, camera?.feedOn, overlay, width]);
 
   return { canvasRef, status };
 }

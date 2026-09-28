@@ -179,6 +179,12 @@ def _process_one_track(camera_id: int, track_id: int, bbox: list[float], confide
     result.update(state=track_state.state, person_id=track_state.person_id, confidence=round(track_state.confidence, 3))
 
     if person_id is not None:
+        # The raw per-observation match, so the caller can add a view the
+        # gallery covers poorly to this person (footfall._learn_view).
+        result["match"] = {
+            "person_id": person_id, "score": float(score), "quality_score": quality.composite_score,
+            "embedding": embedding.astype(np.float32).tolist(),
+        }
         # Matched — this track is no longer accumulating toward a NEW
         # identity (spec: don't auto-create a duplicate for someone who
         # already matched, even if the match only arrived after a few

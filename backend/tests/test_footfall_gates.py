@@ -170,3 +170,68 @@ def test_enroll_recheck_matches_identity_created_by_another_gate(svc):
 
 def test_non_gate_cameras_are_not_in_the_breakdown(svc):
     assert [g["name"] for g in svc.summary()["gates"]] == ["Gate 1", "Gate 2", "Gate 3"]
+
+
+def test_reset_restarts_the_count_and_numbering(svc):
+    walk_past(svc, GATE_1, person=1, track_id=1)
+    walk_past(svc, GATE_2, person=2, track_id=1)
+    assert svc.summary()["unique_today"] == 2
+
+    assert svc.reset()["people_removed"] == 2
+    s = svc.summary()
+    assert s["unique_today"] == 0 and s["visitors"] == [] and svc.people() == []
+
+    # Runners were dropped by reset; rebuild them like feed() would.
+    for cid, scene in svc.scenes.items():
+        runner = footfall._GateRunner(cid, svc._gallery, svc._generation)
+        runner.state.tracker, runner.state.embedder = FakeTracker(scene), FakeEmbedder(scene)
+        svc._runners[cid] = runner
+    walk_past(svc, GATE_3, person=1, track_id=7)
+    people = svc.people()
+    assert svc.summary()["unique_today"] == 1
+    assert people[0]["label"] == "PERSON_001" and people[0]["gates"] == ["Gate 3"]
+
+
+def test_result_computed_before_reset_is_discarded(svc):
+    old_generation = svc._generation
+    svc.reset()
+    stale = {"tracks": [{"track_id": 1, "bbox": [0, 0, 1, 1], "state": "unknown", "person_id": None,
+                         "confidence": 0.9, "pending_new_person": [
+                             {"embedding": person_embedding(9).tolist(), "quality_score": 0.8, "crop_jpeg": None}]}]}
+    svc._record(GATE_1, stale, old_generation)
+    assert svc.summary()["unique_today"] == 0
+
+
+def rebuild_runner(svc, cid):
+    runner = footfall._GateRunner(cid, svc._gallery, svc._generation)
+    scene = svc.scenes[cid]
+    runner.state.tracker, runner.state.embedder = FakeTracker(scene), FakeEmbedder(scene)
+    svc._runners[cid] = runner
+
+
+def test_poorly_covered_view_of_a_confirmed_person_is_learned(svc):
+    walk_past(svc, GATE_1, person=1, track_id=1)
+    pid = reid_db.list_persons()[0]["id"]
+    before = reid_db.embedding_count_for_person(pid)
+    track = {"track_id": 3, "state": "confirmed", "person_id": pid, "confidence": 0.8,
+             "match": {"person_id": pid, "score": 0.78, "quality_score": 0.7,
+                       "embedding": another_view(person_embedding(1), 777).tolist()}}
+    svc._record(GATE_3, {"tracks": [track]})
+    assert reid_db.embedding_count_for_person(pid) == before + 1
+    # A view the gallery already covers well is not stored again.
+    track["match"]["score"] = 0.95
+    track["track_id"] = 4
+    svc._record(GATE_3, {"tracks": [track]})
+    assert reid_db.embedding_count_for_person(pid) == before + 1
+
+
+def test_people_outside_the_counting_zone_are_ignored(svc):
+    # FakeScene puts track 1 at x=170..280 of a 520px-wide frame (centre ~0.43).
+    svc.set_zone(GATE_1, [[0.0, 0.0], [0.3, 0.0], [0.3, 1.0], [0.0, 1.0]])  # left 30% only
+    rebuild_runner(svc, GATE_1)
+    walk_past(svc, GATE_1, person=1, track_id=1)
+    assert svc.summary()["unique_today"] == 0
+    svc.set_zone(GATE_1, None)  # whole frame again
+    rebuild_runner(svc, GATE_1)
+    walk_past(svc, GATE_1, person=1, track_id=4)
+    assert svc.summary()["unique_today"] == 1

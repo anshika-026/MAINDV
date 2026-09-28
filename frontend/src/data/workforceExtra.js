@@ -20,15 +20,3 @@ export const peopleAnalyticsExtra = [
   { name: "K.V Ramasubramanian", lastSeen: "Technical Section", lastSeenAt: "26 Aug, 05:03 PM", clips: 28 },
 ];
 
-export const deskAnalyticsExtra = [
-  { person: "Rohan Sawant", firstSeen: "28 Aug, 09:10 AM", lastSeen: "28 Aug, 01:40 PM", deskTime: "3h 40m", awayTime: "22m", currentDesk: "Desk 5", status: "At Desk", movements: 3 },
-  { person: "K.V Ramasubramanian", firstSeen: "28 Aug, 08:55 AM", lastSeen: "28 Aug, 12:05 PM", deskTime: "1h 58m", awayTime: "40m", currentDesk: "Desk 8", status: "Away", movements: 6 },
-  { person: "Mukul Singh", firstSeen: "28 Aug, 09:30 AM", lastSeen: "28 Aug, 02:15 PM", deskTime: "4h 05m", awayTime: "8m", currentDesk: "Desk 3", status: "At Desk", movements: 1 },
-];
-
-export const initialDeskZones = [
-  { name: "Desk 2", type: "Entry" },
-  { name: "Desk 3", type: "Entry" },
-  { name: "Desk 5", type: "Exit" },
-  { name: "Desk 8", type: "Entry" },
-];

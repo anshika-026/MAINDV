@@ -11,8 +11,8 @@ function formatTimestamp(date) {
 // Full-size single-camera viewer opened by clicking a LiveCameraTile —
 // same feed, same websocket wiring, just enlarged with a live clock overlay
 // instead of the tile's compact badge.
-export default function CameraViewerModal({ camera, onClose }) {
-  const { canvasRef, status } = useLiveCameraFeed(camera);
+export default function CameraViewerModal({ camera, onClose, overlay = true }) {
+  const { canvasRef, status } = useLiveCameraFeed(camera, { overlay });
   const [now, setNow] = useState(new Date());
 
   useEffect(() => {

@@ -51,6 +51,9 @@ import supervision as sv
 from ultralytics import YOLO
 import insightface
 
+from app import alerts
+from app import attendance
+from app import desks
 from app import face_db
 from app import employee_directory
 
@@ -398,6 +401,7 @@ class CameraFacePipeline:
         # reasoning as _recent_captures above (single writer thread) plus
         # CPython list/attribute assignment being atomic under the GIL.
         self._live_detections: list[dict] = []
+        self.frame_size: tuple[int, int] | None = None  # (width, height) of frames fed in
         self._ensure_models_loaded()
 
         # ByteTrack: lightweight, no GPU needed, just IoU + Kalman motion.
@@ -537,6 +541,7 @@ class CameraFacePipeline:
         connected viewer) is skipped while has_viewer is False, so it isn't
         burning CPU around the clock for a display nobody is looking at."""
         now = time.time()
+        self.frame_size = (frame.shape[1], frame.shape[0])
         if now - self._last_sample_time < (1.0 / SAMPLE_FPS):
             return
         self._last_sample_time = now
@@ -577,6 +582,16 @@ class CameraFacePipeline:
                 state.best_conf = score
                 state.best_area = area
                 state.best_crop = crop.copy()
+
+        # Desk analytics (desks.py): identifies faces sitting inside a drawn
+        # desk outline, about once a second. Called even with no faces so
+        # the tracker can mark people away once their grace period lapses.
+        if desks.service.has_zones(self.camera_id):
+            desks.service.observe(
+                self.camera_id, frame.shape,
+                [(int(tracked.tracker_id[i]), [float(v) for v in tracked.xyxy[i]]) for i in range(len(tracked))],
+                lambda bbox: self._identify(frame, bbox),
+            )
 
         # Drop stale tracks and flush any that finished (left frame / went stale)
         # to recognition — this is where "best frame per track" pays off:
@@ -854,6 +869,10 @@ class CameraFacePipeline:
 
         predicted = str(clf.classes_[best_idx])
 
+        # Live-view reads mark attendance too, so someone is checked in the
+        # moment they're recognised rather than when their face track ends.
+        attendance.record(predicted, self.camera_id, score)
+
         if predicted == pstate.current_identity:
             # Already showing this person — just refresh the grace timer
             # and confidence, no need to re-run the stability vote.
@@ -871,6 +890,25 @@ class CameraFacePipeline:
             pstate.current_identity = predicted
             pstate.identity_confidence = score
             pstate.last_recognized_time = time.time()
+
+    def _identify(self, frame: np.ndarray, bbox) -> tuple[str | None, float]:
+        """Employee id + classifier probability for one face box, for
+        desks.py. (None, 0.0) if there's no trained classifier or no clean
+        aligned face in the crop."""
+        clf = self._get_classifier()
+        if clf is None:
+            return None, 0.0
+        x1, y1, x2, y2 = (max(0, int(v)) for v in bbox)
+        px1, py1, px2, py2 = self._pad_bbox(x1, y1, x2, y2, frame.shape)
+        crop = frame[py1:py2, px1:px2]
+        if crop.size == 0:
+            return None, 0.0
+        embedding = self._embed(crop)
+        if embedding is None:
+            return None, 0.0
+        proba = clf.predict_proba(embedding.reshape(1, -1))[0]
+        best = int(np.argmax(proba))
+        return str(clf.classes_[best]), float(proba[best])
 
     def get_live_detections(self) -> list[dict]:
         """Snapshot for the /ws/detections/{camera_id} route — see the
@@ -1058,10 +1096,15 @@ class CameraFacePipeline:
         person_id, score = self._match(embedding)
 
         if person_id is not None and score >= self._match_threshold():
-            # Confident match: no human needed. Optionally still log the
-            # sighting somewhere (attendance/footfall tables) — not shown
-            # here since that's a separate concern from recognition itself.
+            # Confident match: no human needed. Marks attendance (attendance.py
+            # applies its own, stricter confidence bar).
+            attendance.record(person_id, self.camera_id, score)
             return
+
+        # A face nobody recognises at a gate is an "Unknown Person" alert
+        # (alerts.py decides: gate cameras only, clearly-unknown only, rate-limited).
+        ok, jpg = cv2.imencode(".jpg", state.best_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        alerts.unknown_face(self.camera_id, score if person_id is not None else 0.0, jpg.tobytes() if ok else None)
 
         # Below threshold (or empty gallery) -> queue for human review,
         # but don't spam the same track twice within REVIEW_DEDUPE_SECONDS.

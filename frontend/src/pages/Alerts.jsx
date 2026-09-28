@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Calendar, Route } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, Calendar } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
 import StatusBadge from "../components/StatusBadge";
 import SidePanel from "../components/SidePanel";
 import { useAuth } from "../context/AuthContext";
-import { alertDetails, defaultAlertDetail, resolutionReasons } from "../data/alertsDetail";
+const resolutionReasons = ["Visitor with permission", "Employee not yet enrolled", "False alarm", "Fixed", "Duplicate", "Other"];
+const RANGES = { Today: "today", Yesterday: "yesterday", "This week": "week", "All time": "all" };
+const REFRESH_MS = 15000;
 import * as api from "../api/client";
 
 const STATUS_OPTIONS = ["Active", "Acknowledged", "Resolved"];
@@ -74,14 +76,49 @@ export default function Alerts() {
   const [selected, setSelected] = useState(null);
   const [resolving, setResolving] = useState(false);
   const [reason, setReason] = useState("");
-  const [journeyOpen, setJourneyOpen] = useState(false);
+  const [snapshotUrl, setSnapshotUrl] = useState(null);
+  const [error, setError] = useState("");
 
   const filterRef = useRef(null);
 
+  const load = useCallback(() => {
+    Promise.all([api.getAlertsSummary(), api.getAlerts(RANGES[dateRange])])
+      .then(([s, a]) => {
+        setSummary(s);
+        setAlerts(a);
+        setError("");
+      })
+      .catch(() => setError("Couldn't load alerts. Check the backend is running."));
+  }, [dateRange]);
+
   useEffect(() => {
-    api.getAlertsSummary().then(setSummary);
-    api.getAlerts().then(setAlerts);
-  }, []);
+    load();
+    const t = setInterval(load, REFRESH_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  // Keep the open panel in sync with refreshed data (e.g. someone else resolved it).
+  useEffect(() => {
+    if (selected) {
+      const fresh = alerts.find((a) => a.id === selected.id);
+      if (fresh && fresh.status !== selected.status) setSelected(fresh);
+    }
+  }, [alerts, selected]);
+
+  useEffect(() => {
+    let url = null;
+    setSnapshotUrl(null);
+    if (selected?.hasSnapshot) {
+      api
+        .fetchAlertSnapshotObjectUrl(selected.id)
+        .then((u) => {
+          url = u;
+          setSnapshotUrl(u);
+        })
+        .catch(() => setSnapshotUrl(null));
+    }
+    return () => url && URL.revokeObjectURL(url);
+  }, [selected?.id, selected?.hasSnapshot]);
 
   useEffect(() => {
     function onOutside(e) {
@@ -103,9 +140,6 @@ export default function Alerts() {
       (!eventFilter || a.event === eventFilter)
   );
 
-  const activeCount = alerts.filter((a) => a.status === "Active").length;
-  const acknowledgedCount = alerts.filter((a) => a.status === "Acknowledged").length;
-  const resolvedTodayCount = alerts.filter((a) => a.status === "Resolved").length;
 
   function clearFilters() {
     setStatusFilter(null);
@@ -117,29 +151,26 @@ export default function Alerts() {
     setSelected(row);
     setResolving(false);
     setReason("");
-    setJourneyOpen(false);
   }
 
   function closePanel() {
     setSelected(null);
     setResolving(false);
     setReason("");
-    setJourneyOpen(false);
+  }
+
+  async function handleAcknowledge() {
+    await api.acknowledgeAlert(selected.id);
+    setSelected({ ...selected, status: "Acknowledged", acknowledgedBy: user?.email || "you" });
+    load();
   }
 
   async function handleConfirmResolve() {
     if (!selected || !reason) return;
     await api.resolveAlert(selected.id, reason);
-    const resolvedBy = user?.name || "You";
-    setAlerts((prev) =>
-      prev.map((a) =>
-        a.id === selected.id ? { ...a, status: "Resolved", resolvedBy, resolutionReason: reason } : a
-      )
-    );
     closePanel();
+    load();
   }
-
-  const detail = selected ? alertDetails[selected.id] || defaultAlertDetail : defaultAlertDetail;
 
   return (
     <div className="space-y-5">
@@ -147,22 +178,19 @@ export default function Alerts() {
 
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard label="Active Alerts" value={activeCount} subTone="danger" />
-          <StatCard label="Acknowledged Alerts" value={acknowledgedCount} subTone="neutral" />
+          <StatCard label="Active Alerts" value={summary.active} subTone="danger" />
+          <StatCard label="Acknowledged Alerts" value={summary.acknowledged} subTone="neutral" />
           <StatCard
             label="Resolved today"
-            value={resolvedTodayCount}
-            sub="+2 vs yesterday"
-            subTone="success"
+            value={summary.resolved_today}
+            sub={`${summary.resolved_yesterday} yesterday`}
+            subTone="neutral"
           />
-          <StatCard
-            label="Live alerts"
-            value={summary.liveAlerts}
-            sub="-2 vs yesterday"
-            subTone="danger"
-          />
+          <StatCard label="Raised in the last hour" value={summary.raised_last_hour} sub={`${summary.raised_today} today`} subTone="neutral" />
         </div>
       )}
+
+      {error && <p className="text-sm text-danger-500">{error}</p>}
 
       <div ref={filterRef} className="flex items-center flex-wrap gap-2">
         <button
@@ -242,58 +270,30 @@ export default function Alerts() {
         {selected && (
           <div className="space-y-5">
             {/* Video-frame thumbnail with a simulated detection box */}
-            <div className="relative w-full aspect-video rounded-xl bg-[#0c0c14] border border-[#23243a] overflow-hidden">
-              <div
-                className="absolute border-2 rounded-sm"
-                style={{
-                  top: "28%",
-                  left: "38%",
-                  width: "26%",
-                  height: "48%",
-                  borderColor: "#ec2f9c",
-                  boxShadow: "0 0 0 1px rgba(236,47,156,0.35)",
-                }}
-              />
-              <span className="absolute bottom-2 right-2 text-[11px] text-white/50 font-mono">
-                {selected.camera}
-              </span>
-            </div>
+            {selected.hasSnapshot && (
+              <div className="w-full rounded-xl bg-[#0c0c14] border border-[#23243a] overflow-hidden flex items-center justify-center min-h-[160px]">
+                {snapshotUrl ? (
+                  <img src={snapshotUrl} alt={`Snapshot for ${selected.event}`} className="max-h-72 object-contain" />
+                ) : (
+                  <span className="text-xs text-white/40">Loading snapshot…</span>
+                )}
+              </div>
+            )}
+            {selected.message && <p className="text-sm text-ink-900">{selected.message}</p>}
 
             <div className="space-y-2.5 text-sm">
               <Row label="Detection Type" value={selected.event} />
               <Row label="Camera" value={selected.camera} />
               <Row label="Location" value={selected.location} />
               <Row label="Timestamp" value={`${selected.date} · ${selected.time}`} />
-              <Row label="Confidence" value={`${detail.confidence}%`} />
-              <div className="flex items-center justify-between py-1">
-                <span className="text-slate-400">Person known</span>
-                <StatusBadge value={detail.personKnown} />
-              </div>
+              <Row label="Severity" value={selected.severity} />
+              {selected.confidence != null && selected.event === "Unknown Person" && (
+                <Row label="Closest employee match" value={`${Math.round(selected.confidence * 100)}%`} />
+              )}
+              {selected.occurrences > 1 && <Row label="Seen again" value={`${selected.occurrences - 1}× · last at ${selected.lastSeen}`} />}
+              {selected.acknowledgedBy && <Row label="Acknowledged by" value={selected.acknowledgedBy} />}
             </div>
 
-            <button
-              onClick={() => setJourneyOpen((v) => !v)}
-              className="flex items-center gap-1.5 text-sm font-medium text-brand-600 hover:text-brand-700"
-            >
-              <Route size={15} />
-              {journeyOpen ? "Hide journey" : "Track journey"}
-            </button>
-
-            {journeyOpen && (
-              <div className="rounded-xl bg-[#f8f8fc] border border-[#eceef4] p-3 space-y-2">
-                {detail.journey.length === 0 ? (
-                  <p className="text-xs text-slate-400">No prior sightings recorded.</p>
-                ) : (
-                  detail.journey.map((j, i) => (
-                    <div key={i} className="flex items-center justify-between text-xs">
-                      <span className="text-slate-500">{j.time}</span>
-                      <span className="text-ink-900 font-medium">{j.location}</span>
-                      <span className="text-slate-400 font-mono">{j.camera}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
 
             <div className="border-t border-[#eceef4] pt-4">
               {selected.status === "Resolved" ? (
@@ -302,9 +302,16 @@ export default function Alerts() {
                   {selected.resolutionReason ? ` · ${selected.resolutionReason}` : ""}
                 </div>
               ) : !resolving ? (
-                <button onClick={() => setResolving(true)} className="btn-primary w-full">
-                  Resolve
-                </button>
+                <div className="flex items-center gap-3">
+                  {selected.status === "Active" && (
+                    <button onClick={handleAcknowledge} className="btn-secondary flex-1">
+                      Acknowledge
+                    </button>
+                  )}
+                  <button onClick={() => setResolving(true)} className="btn-primary flex-1">
+                    Resolve
+                  </button>
+                </div>
               ) : (
                 <div className="space-y-3">
                   <div>

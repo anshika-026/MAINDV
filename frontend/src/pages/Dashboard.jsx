@@ -8,10 +8,23 @@ export default function Dashboard() {
   const { user } = useAuth();
   const [stats, setStats] = useState(null);
 
+  const [error, setError] = useState("");
+
   useEffect(() => {
-    api.getDashboardStats().then(setStats);
+    const load = () =>
+      api
+        .getDashboardStats()
+        .then((s) => {
+          setStats(s);
+          setError("");
+        })
+        .catch(() => setError("Couldn't load the dashboard. Check the backend is running on port 8821."));
+    load();
+    const t = setInterval(load, 30000);
+    return () => clearInterval(t);
   }, []);
 
+  if (error && !stats) return <p className="text-sm text-danger-500">{error}</p>;
   if (!stats) return <p className="text-sm text-slate-400">Loading dashboard…</p>;
 
   const s = stats.admin;
@@ -30,10 +43,10 @@ export default function Dashboard() {
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
         <StatCard label="People Present" value={`${s.peoplePresent.value} of ${s.peoplePresent.of}`} sub={s.peoplePresent.sub} />
         <StatCard label="Footfall Today" value={s.footfallToday.value} sub={s.footfallToday.sub} subTone="neutral" />
-        <StatCard label="Unknown Visitors" value={s.unknownVisitors.value} sub={s.unknownVisitors.sub} />
-        <StatCard label="Cameras" value={s.camerasOnline.value} sub={s.camerasOnline.sub} subTone="danger" />
-        <StatCard label="Guests Incoming" value={s.guestsIncoming.value} sub="" />
-        <StatCard label="Active Alerts" value={s.activeAlerts.value} sub={s.activeAlerts.sub} subTone="danger" />
+        <StatCard label="Unrecognised Faces" value={s.unknownVisitors.value} sub={s.unknownVisitors.sub} subTone="neutral" />
+        <StatCard label="Cameras Online" value={s.camerasOnline.value} sub={s.camerasOnline.sub} subTone="danger" />
+        <StatCard label="Current Staff" value={s.currentStaff.value} sub={s.currentStaff.sub} subTone="neutral" />
+        <StatCard label="Active Alerts" value={s.activeAlerts.value} sub={s.activeAlerts.sub} subTone="neutral" />
       </div>
 
       <div className="grid md:grid-cols-2 gap-5">
@@ -42,9 +55,9 @@ export default function Dashboard() {
             <h3 className="font-semibold text-ink-900 flex items-center gap-2">
               <AlertTriangle size={16} className="text-danger-500" /> Needs attention
             </h3>
-            <button className="text-xs text-brand-600 font-medium">View all</button>
           </div>
           <div className="space-y-3">
+            {stats.needsAttention.length === 0 && <p className="text-sm text-slate-500">Nothing needs attention right now.</p>}
             {stats.needsAttention.map((item, i) => (
               <div key={i} className="flex items-center justify-between border border-[#f1f2f7] rounded-xl px-4 py-3">
                 <div>

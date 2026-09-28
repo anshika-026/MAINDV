@@ -9,11 +9,14 @@ import ClientLogin from "./pages/ClientLogin";
 import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import LiveFeed from "./pages/LiveFeed";
+import PlainLiveFeed from "./pages/PlainLiveFeed";
 import Alerts from "./pages/Alerts";
 import People from "./pages/People";
 import Attendance from "./pages/Attendance";
 import Workforce from "./pages/Workforce";
 import Footfall from "./pages/Footfall";
+import StaffCount from "./pages/StaffCount";
+import FootfallUat from "./pages/FootfallUat";
 import Intrusion from "./pages/Intrusion";
 import CameraManagement from "./pages/CameraManagement";
 import SiteManagement from "./pages/SiteManagement";
@@ -55,12 +58,15 @@ export default function App() {
             }
           >
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/live-feed" element={<PlainLiveFeed />} />
             <Route path="/live-camera" element={<LiveFeed />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/people" element={<People />} />
             <Route path="/attendance" element={<Attendance />} />
+            <Route path="/staff" element={<StaffCount />} />
             <Route path="/workforce" element={<Workforce />} />
             <Route path="/footfall" element={<Footfall />} />
+            <Route path="/footfall-uat" element={<AdminRoute><FootfallUat /></AdminRoute>} />
             <Route path="/intrusion" element={<Intrusion />} />
             <Route path="/cameras" element={<AdminRoute><CameraManagement /></AdminRoute>} />
             <Route path="/sites" element={<AdminRoute><SiteManagement /></AdminRoute>} />

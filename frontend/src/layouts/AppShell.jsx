@@ -4,12 +4,15 @@ import Topbar from "./Topbar";
 
 const TITLES = {
   "/dashboard": "Dashboard",
-  "/live-camera": "Live feed",
+  "/live-feed": "Live Feed",
+  "/live-camera": "AI Analytics",
   "/alerts": "Alerts",
   "/people": "People",
   "/attendance": "Attendance",
+  "/staff": "Staff Count",
   "/workforce": "Workforce",
   "/footfall": "Footfall",
+  "/footfall-uat": "Footfall UAT",
   "/intrusion": "Intrusion",
   "/cameras": "Camera Management",
   "/sites": "Site Management",

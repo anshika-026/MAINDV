@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Pencil, Trash2 } from "lucide-react";
+import { Pencil, Trash2, Video } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
 import StatusBadge from "../components/StatusBadge";
 import Modal from "../components/Modal";
 import Tabs from "../components/Tabs";
+import ToggleSwitch from "../components/ToggleSwitch";
 import * as api from "../api/client";
 
 // The backend has no per-camera health metric yet, so we derive a
@@ -26,11 +27,25 @@ function healthTone(pct) {
 
 const VIEWS = ["All", "Camera Health"];
 const PURPOSES = ["General", "Theft", "Entry/Exit", "Surveillance", "Safety"];
+const EMPTY_FORM = { streamUrl: "", driveName: "", site: "", purpose: "General", code: "", attendanceTracking: false };
+
+// What the Add Camera form can tell from the link alone, before testing it.
+function describeRtsp(url) {
+  if (!url.trim()) return null;
+  if (!/^rtsp:\/\//i.test(url.trim())) return { error: "The link must start with rtsp://" };
+  const p = api.parseRtspUrl(url.trim());
+  if (!p.host) return { error: "The link has no camera address after the @" };
+  return p;
+}
 
 export default function CameraManagement() {
   const [cameras, setCameras] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
-  const [form, setForm] = useState({ code: "", driveName: "", purpose: "", site: "" });
+  const [form, setForm] = useState(EMPTY_FORM);
+  const [sites, setSites] = useState([]);
+  const [test, setTest] = useState({ state: "idle", url: "", message: "" });
+  const [saving, setSaving] = useState(false);
+  const [addError, setAddError] = useState("");
   const [view, setView] = useState("All");
   const [editing, setEditing] = useState(null);
   const [toast, setToast] = useState("");
@@ -49,16 +64,54 @@ export default function CameraManagement() {
   }
 
   const online = cameras.filter((c) => c.status === "Active").length;
+  const rtspInfo = describeRtsp(form.streamUrl);
   const avgHealth = cameras.length
     ? Math.round(cameras.reduce((sum, c) => sum + healthForCamera(c.id), 0) / cameras.length)
     : null;
 
+  function openAdd() {
+    setForm(EMPTY_FORM);
+    setTest({ state: "idle", url: "", message: "" });
+    setAddError("");
+    setAddOpen(true);
+    api
+      .getSites()
+      .then((list) => {
+        setSites(list);
+        if (list.length === 1) setForm((f) => ({ ...f, site: f.site || list[0].name }));
+      })
+      .catch(() => setSites([]));
+  }
+
+  async function runTest() {
+    setTest({ state: "testing", url: "", message: "" });
+    try {
+      const url = await api.testCameraStream(form.streamUrl.trim());
+      setTest({ state: "ok", url, message: "" });
+    } catch (err) {
+      setTest({ state: "failed", url: "", message: err.message });
+    }
+  }
+
   async function handleAdd(e) {
     e.preventDefault();
-    await api.addCamera(form);
-    setAddOpen(false);
-    setForm({ code: "", driveName: "", purpose: "", site: "" });
-    refresh();
+    const parsed = describeRtsp(form.streamUrl);
+    if (!parsed || parsed.error) {
+      setAddError(parsed?.error || "Paste the camera's RTSP link");
+      return;
+    }
+    setSaving(true);
+    setAddError("");
+    try {
+      await api.addCamera({ ...form, streamUrl: form.streamUrl.trim() });
+      setAddOpen(false);
+      showToast(`${form.driveName} added. Open Live Feed to watch it.`);
+      refresh();
+    } catch {
+      setAddError("Couldn't save the camera. Check the backend is running.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   function openEdit(cam) {
@@ -104,6 +157,22 @@ export default function CameraManagement() {
     refresh();
   }
 
+  // Feed off = the backend stops connecting to this camera entirely (no live
+  // view, no analytics, no background streaming), freeing CPU and bandwidth.
+  const [switching, setSwitching] = useState(null);
+  async function toggleFeed(cam, on) {
+    setSwitching(cam.id);
+    try {
+      await api.updateCamera(cam.id, { live_feed_enabled: on });
+      showToast(on ? `${cam.label} feed switched on` : `${cam.label} feed switched off: it's no longer streamed or analysed`);
+      refresh();
+    } catch {
+      showToast(`Couldn't change ${cam.label}. Check the backend is running.`);
+    } finally {
+      setSwitching(null);
+    }
+  }
+
   async function handleDelete(cam) {
     if (!window.confirm(`Remove camera "${cam.label}"? This cannot be undone.`)) return;
     await api.deleteCamera(cam.id);
@@ -116,7 +185,7 @@ export default function CameraManagement() {
       <PageHeader
         title="Camera Management"
         action={
-          <button onClick={() => setAddOpen(true)} className="btn-primary text-sm">
+          <button onClick={openAdd} className="btn-primary text-sm">
             + Add camera
           </button>
         }
@@ -145,7 +214,16 @@ export default function CameraManagement() {
             { key: "site", label: "Site" },
             { key: "purpose", label: "Purpose" },
             { key: "status", label: "Status", render: (r) => <StatusBadge value={r.status} /> },
-            { key: "live", label: "Live feed" },
+            {
+              key: "live",
+              label: "Live feed",
+              render: (r) => (
+                <span className="flex items-center gap-2">
+                  <ToggleSwitch checked={r.feedOn} onChange={(on) => toggleFeed(r, on)} disabled={!r.isConfigured || switching === r.id} />
+                  <span className="text-xs text-slate-500">{r.feedOn ? "On" : "Off"}</span>
+                </span>
+              ),
+            },
             {
               key: "action",
               label: "Actions",
@@ -204,49 +282,153 @@ export default function CameraManagement() {
         </div>
       )}
 
-      <Modal open={addOpen} onClose={() => setAddOpen(false)} title="Add Camera">
+      <Modal open={addOpen} onClose={() => setAddOpen(false)} title="Add Camera" width="max-w-lg">
         <form onSubmit={handleAdd} className="space-y-4">
           <div>
-            <label className="text-sm font-medium text-ink-900 block mb-1.5">Cam Code</label>
-            <input
-              required
-              value={form.code}
-              onChange={(e) => setForm((f) => ({ ...f, code: e.target.value }))}
-              placeholder="CAM-XXXX-XXXX-XXXX"
-              className="input-field"
-            />
+            <label htmlFor="add-rtsp" className="text-sm font-medium text-ink-900 block mb-1.5">
+              RTSP link <span className="text-danger-500">*</span>
+            </label>
+            <div className="flex gap-2">
+              <input
+                id="add-rtsp"
+                required
+                autoFocus
+                value={form.streamUrl}
+                onChange={(e) => {
+                  setForm((f) => ({ ...f, streamUrl: e.target.value }));
+                  setTest({ state: "idle", url: "", message: "" });
+                }}
+                placeholder="rtsp://user:password@192.168.1.10:554/stream"
+                className="input-field font-mono text-xs flex-1"
+              />
+              <button
+                type="button"
+                onClick={runTest}
+                disabled={!rtspInfo || !!rtspInfo.error || test.state === "testing"}
+                className="btn-secondary text-sm whitespace-nowrap disabled:opacity-50"
+              >
+                {test.state === "testing" ? "Testing…" : "Test"}
+              </button>
+            </div>
+            {!rtspInfo && (
+              <p className="text-xs text-slate-400 mt-1.5">Paste the full link from the camera or NVR, including the login.</p>
+            )}
+            {rtspInfo?.error && <p className="text-xs text-danger-500 mt-1.5">{rtspInfo.error}</p>}
+            {rtspInfo && !rtspInfo.error && (
+              <p className="text-xs text-slate-500 mt-1.5">
+                Camera <span className="font-mono">{rtspInfo.host}:{rtspInfo.port}</span>
+                {rtspInfo.user && (
+                  <>
+                    {" "}· user <span className="font-mono">{rtspInfo.user}</span>
+                  </>
+                )}
+                {rtspInfo.password ? " · password included" : " · no password"} · path{" "}
+                <span className="font-mono">{rtspInfo.streamPath}</span>
+              </p>
+            )}
+            {test.state === "ok" && (
+              <div className="mt-2 rounded-lg overflow-hidden border border-border-200">
+                <img src={test.url} alt="Still from the camera" className="w-full aspect-video object-cover" />
+                <p className="text-xs text-success-600 px-3 py-1.5">Connected. This is what the camera sees right now.</p>
+              </div>
+            )}
+            {test.state === "failed" && <p className="text-xs text-danger-500 mt-1.5">{test.message}</p>}
           </div>
-          <div>
-            <label className="text-sm font-medium text-ink-900 block mb-1.5">Give name to camera</label>
-            <input
-              required
-              value={form.driveName}
-              onChange={(e) => setForm((f) => ({ ...f, driveName: e.target.value }))}
-              placeholder="e.g. Entry / Exit"
-              className="input-field"
-            />
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="add-name" className="text-sm font-medium text-ink-900 block mb-1.5">
+                Camera name <span className="text-danger-500">*</span>
+              </label>
+              <input
+                id="add-name"
+                required
+                value={form.driveName}
+                onChange={(e) => setForm((f) => ({ ...f, driveName: e.target.value }))}
+                placeholder="e.g. Gate 2"
+                className="input-field"
+              />
+            </div>
+            <div>
+              <label htmlFor="add-site" className="text-sm font-medium text-ink-900 block mb-1.5">
+                Site <span className="text-danger-500">*</span>
+              </label>
+              <input
+                id="add-site"
+                required
+                list="add-site-options"
+                value={form.site}
+                onChange={(e) => setForm((f) => ({ ...f, site: e.target.value }))}
+                placeholder="Noida Site"
+                className="input-field"
+              />
+              <datalist id="add-site-options">
+                {sites.map((site) => (
+                  <option key={site.id} value={site.name} />
+                ))}
+              </datalist>
+            </div>
           </div>
-          <div>
-            <label className="text-sm font-medium text-ink-900 block mb-1.5">Purpose (optional)</label>
-            <input
-              value={form.purpose}
-              onChange={(e) => setForm((f) => ({ ...f, purpose: e.target.value }))}
-              placeholder="Theft, General"
-              className="input-field"
-            />
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="add-purpose" className="text-sm font-medium text-ink-900 block mb-1.5">
+                Purpose
+              </label>
+              <select
+                id="add-purpose"
+                value={form.purpose}
+                onChange={(e) => setForm((f) => ({ ...f, purpose: e.target.value }))}
+                className="input-field"
+              >
+                {PURPOSES.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="add-code" className="text-sm font-medium text-ink-900 block mb-1.5">
+                Cam code (optional)
+              </label>
+              <input
+                id="add-code"
+                value={form.code}
+                onChange={(e) => setForm((f) => ({ ...f, code: e.target.value }))}
+                placeholder="CAM-XXXX"
+                className="input-field"
+              />
+            </div>
           </div>
-          <div>
-            <label className="text-sm font-medium text-ink-900 block mb-1.5">Site</label>
+          {form.purpose === "Entry/Exit" && (
+            <p className="text-xs text-brand-600 -mt-2">
+              Entry/Exit cameras count unique footfall. Draw the doorway zone on the Footfall UAT page after adding.
+            </p>
+          )}
+
+          <label className="flex items-start gap-2.5 cursor-pointer">
             <input
-              required
-              value={form.site}
-              onChange={(e) => setForm((f) => ({ ...f, site: e.target.value }))}
-              placeholder="Noida"
-              className="input-field"
+              type="checkbox"
+              checked={form.attendanceTracking}
+              onChange={(e) => setForm((f) => ({ ...f, attendanceTracking: e.target.checked }))}
+              className="mt-0.5 accent-brand-500"
             />
-          </div>
-          <button type="submit" className="btn-primary w-full">
-            Add
+            <span>
+              <span className="block text-sm font-medium text-ink-900">Run face recognition on this camera</span>
+              <span className="block text-xs text-slate-500">
+                Leave off for live view only. Face recognition uses a lot of CPU per camera.
+              </span>
+            </span>
+          </label>
+
+          {addError && <p className="text-sm text-danger-500">{addError}</p>}
+          <button
+            type="submit"
+            disabled={saving}
+            className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-60"
+          >
+            <Video size={15} /> {saving ? "Adding…" : "Add camera"}
           </button>
         </form>
       </Modal>

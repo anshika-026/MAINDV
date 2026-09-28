@@ -9,3 +9,9 @@ data/reid_snapshots/
 
 __pycache__/
 *.pyc
+
+# SQLite WAL-mode working files (app.db is in WAL mode, see main.py _enable_wal)
+data/app.db-wal
+data/app.db-shm
+# Alert snapshots of real people - private, runtime-only
+data/alert_snapshots/

@@ -29,7 +29,16 @@ from collections import Counter
 
 import numpy as np
 
-from . import camera_db, camera_stream
+# Imported here, i.e. on the main thread while the app starts, not lazily
+# inside a camera thread: face detection (ultralytics) and Re-ID (torchreid)
+# each import torchvision on first use, and two camera threads doing that at
+# the same moment fail with "cannot import name ... from partially
+# initialized module 'torchvision.transforms'" — which disabled both face
+# recognition and footfall on a live restart.
+import torchvision.transforms  # noqa: E402,F401
+from torchreid.reid.utils import FeatureExtractor  # noqa: E402,F401
+
+from . import analytics_settings, camera_db, camera_stream
 from .reid import config as reid_config
 from .reid import peopleid_gallery, reid_db, reid_worker
 
@@ -93,8 +102,11 @@ class _GateRunner:
     detection pass delays only this gate's counting — never the video
     broadcast, and never another gate."""
 
-    def __init__(self, camera_id: int, gallery: _SharedGallery):
+    def __init__(self, camera_id: int, gallery: _SharedGallery, generation: int = 0):
         self.camera_id = camera_id
+        # Which reset() era this runner belongs to — a frame already being
+        # processed when a reset happens must not write into the fresh count.
+        self.generation = generation
         self.state = reid_worker.ReidWorkerState(camera_config=reid_db.get_camera_config(camera_id))
         self.state.gallery = gallery  # replace the private copy with the shared one
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"footfall-{camera_id}")
@@ -115,6 +127,7 @@ class FootfallService:
         # (camera_id, track_id) -> (person_id, last_seen): one sighting
         # event per person per track, not one per processed frame.
         self._sighted: dict[tuple[int, int], tuple[int, float]] = {}
+        self._generation = 0
         self._started = False
 
     # --- lifecycle ---------------------------------------------------------
@@ -142,13 +155,14 @@ class FootfallService:
             time.sleep(GATE_SYNC_INTERVAL_SECONDS)
 
     def _sync_gates(self) -> None:
-        gate_ids = {c["id"] for c in camera_db.list_cameras() if is_gate(c) and c.get("host")}
+        # Switched off: stop keeping gates streaming too, so they cost nothing.
+        gate_ids = {c["id"] for c in camera_db.list_cameras() if is_gate(c) and camera_db.is_streamable(c)} if analytics_settings.enabled("footfall") else set()
         with self._lock:
             added = gate_ids - self._sinks.keys()
             removed = self._sinks.keys() - gate_ids
             for cid in added:
                 sink = _KeepAliveSink()
-                camera_stream.get_stream(cid).subscribe(sink, is_collector=True)
+                camera_stream.get_stream(cid).subscribe(sink, is_collector=True, wants_frames=False)
                 self._sinks[cid] = sink
             for cid in removed:
                 camera_stream.get_stream(cid).unsubscribe(self._sinks.pop(cid))
@@ -161,12 +175,12 @@ class FootfallService:
     # --- per-frame hook (called from camera_stream's read loop) -----------
 
     def feed(self, camera_id: int, frame: np.ndarray) -> None:
-        if self._gallery is None or camera_id not in self._sinks:
+        if self._gallery is None or camera_id not in self._sinks or not analytics_settings.enabled("footfall"):
             return
         runner = self._runners.get(camera_id)
         if runner is None:
             with self._lock:
-                runner = self._runners.setdefault(camera_id, _GateRunner(camera_id, self._gallery))
+                runner = self._runners.setdefault(camera_id, _GateRunner(camera_id, self._gallery, self._generation))
         if runner.failed or (runner.future is not None and not runner.future.done()):
             return
         # Cheap pre-check of process_frame's own cadence gate, so frames it
@@ -181,7 +195,7 @@ class FootfallService:
         try:
             result = reid_worker.process_frame(runner.camera_id, frame, runner.state)
             if result:
-                self._record(runner.camera_id, result)
+                self._record(runner.camera_id, result, runner.generation)
         except Exception:
             # Most likely a model that failed to load. Log once and stop
             # counting on this gate rather than retrying every second; the
@@ -191,15 +205,19 @@ class FootfallService:
 
     # --- turning track results into durable events ------------------------
 
-    def _record(self, camera_id: int, result: dict) -> None:
+    def _record(self, camera_id: int, result: dict, generation: int | None = None) -> None:
         now = time.time()
         with self._write_lock:
+            if generation is not None and generation != self._generation:
+                return  # computed before a reset — belongs to the old count
+            learned = False
             for track in result["tracks"]:
                 pending = track.get("pending_new_person")
                 if pending:
                     person_id = self._enroll(camera_id, track, pending, now)
                     self._sighted[(camera_id, track["track_id"])] = (person_id, now)
                 elif track["state"] == reid_db.TRACK_STATE_CONFIRMED and track["person_id"] is not None:
+                    learned = self._learn_view(camera_id, track) or learned
                     key = (camera_id, track["track_id"])
                     prev = self._sighted.get(key)
                     if prev is None or prev[0] != track["person_id"]:
@@ -210,6 +228,45 @@ class FootfallService:
             cutoff = now - reid_config.REID_TRACK_TIMEOUT_SECONDS * 3
             for key in [k for k, (_pid, seen) in self._sighted.items() if seen < cutoff]:
                 del self._sighted[key]
+            if learned:
+                self._gallery.reload()
+
+    def _learn_view(self, camera_id: int, track: dict) -> bool:
+        """Adds this observation's embedding to the confirmed person when the
+        gallery covered it poorly (a new angle, another gate), so the next
+        time they're seen like this they match instead of becoming a second
+        identity. Only for a confirmed track whose raw match agrees with the
+        fused identity, and capped per person."""
+        match = track.get("match")
+        if not match or match["person_id"] != track["person_id"]:
+            return False
+        if match["score"] >= reid_config.REID_LEARN_BELOW_SIMILARITY:
+            return False  # already well covered
+        if reid_db.embedding_count_for_person(track["person_id"]) >= reid_config.REID_MAX_EMBEDDINGS_PER_PERSON:
+            return False
+        reid_db.add_embedding(track["person_id"], np.asarray(match["embedding"], dtype=np.float32),
+                              match["quality_score"], source_camera=camera_id)
+        return True
+
+    # --- counting zone per gate -------------------------------------------
+
+    def get_zone(self, camera_id: int) -> list | None:
+        return reid_db.get_camera_config(camera_id).get("roi")
+
+    def set_zone(self, camera_id: int, roi: list | None) -> None:
+        """roi: polygon [[x, y], ...] in 0..1 frame fractions, or None to
+        count the whole frame. A person counts only while the centre of
+        their body box is inside it. The gate's runner is dropped so it's
+        rebuilt with the new zone on the next frame."""
+        cfg = reid_db.get_camera_config(camera_id)
+        reid_db.set_camera_config(
+            camera_id, enabled=True, similarity_threshold=cfg.get("similarity_threshold"),
+            quality_min_score=cfg.get("quality_min_score"), mot_interval_seconds=cfg.get("mot_interval_seconds"),
+            roi=roi,
+        )
+        with self._lock:
+            self._runners.pop(camera_id, None)
+        log.info("footfall: counting zone for camera %s set to %s", camera_id, roi or "whole frame")
 
     def _enroll(self, camera_id: int, track: dict, samples: list[dict], now: float) -> int:
         embeddings = [np.asarray(s["embedding"], dtype=np.float32) for s in samples]
@@ -239,6 +296,59 @@ class FootfallService:
         self._gallery.reload()
         log.info("footfall: new person %s at camera %s", person_id, camera_id)
         return person_id
+
+    # --- UAT: restart counting from zero ----------------------------------
+
+    def reset(self) -> dict:
+        """Wipes every Re-ID identity (people, embeddings, snapshots, events)
+        so counting restarts at PERSON_001, and drops all in-memory tracking
+        so nobody half-seen before the reset carries over. Cameras, faces,
+        attendance etc. are untouched — see reid_db.reset_identities."""
+        with self._write_lock:
+            removed = reid_db.reset_identities(delete_snapshot_files=True)
+            self._generation += 1
+            self._sighted.clear()
+            with self._lock:
+                # Fresh fusion/pending state per gate; recreated lazily in feed().
+                self._runners.clear()
+            if self._gallery is not None:
+                self._gallery.reload()
+        log.info("footfall: count reset (%s people removed)", removed.get("reid_persons", 0))
+        return {"people_removed": removed.get("reid_persons", 0), "reset_at": time.time()}
+
+    def people(self, limit: int = 200) -> list[dict]:
+        """Every identity currently in the registry, newest first, with the
+        gates it was seen at and up to 3 snapshot ids for the UAT panel."""
+        names = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+        with reid_db.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT p.id, p.label, p.first_seen, p.last_seen, "
+                "(SELECT GROUP_CONCAT(DISTINCT e.camera_id) FROM reid_events e WHERE e.person_id = p.id), "
+                "(SELECT COUNT(*) FROM reid_events e WHERE e.person_id = p.id) "
+                "FROM reid_persons p ORDER BY p.first_seen DESC LIMIT ?", (limit,),
+            ).fetchall()
+        snaps = reid_db.list_snapshots_bulk([r[0] for r in rows], per_person=3)
+        return [
+            {
+                "id": pid,
+                "label": label,
+                "first_seen": first,
+                "last_seen": last,
+                "gates": [names.get(int(c), f"Camera {c}") for c in (cams or "").split(",") if c],
+                "sightings": sightings,
+                "snapshot_ids": [s["id"] for s in snaps.get(pid, [])],
+            }
+            for pid, label, first, last, cams, sightings in rows
+        ]
+
+    @staticmethod
+    def snapshot_path(snapshot_id: int):
+        with reid_db.get_connection() as conn:
+            row = conn.execute("SELECT file_path FROM reid_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+        if row is None:
+            return None
+        path = reid_db.Path(row[0])
+        return path if path.is_file() else None
 
     # --- reporting --------------------------------------------------------
 
@@ -275,6 +385,7 @@ class FootfallService:
                 "name": g["name"],
                 "unique_today": per_gate.get(g["id"], 0),
                 "counting": g["id"] in self._sinks and not getattr(self._runners.get(g["id"]), "failed", False),
+                "zone": self.get_zone(g["id"]),
             }
             for g in gates
         ]

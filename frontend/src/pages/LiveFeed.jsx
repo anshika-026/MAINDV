@@ -42,7 +42,7 @@ export default function LiveFeed() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Vision" />
+      <PageHeader title="AI Analytics" />
 
       <div className="card p-4 flex flex-wrap items-center gap-6">
         <div className="flex items-center gap-4">

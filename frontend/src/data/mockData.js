@@ -71,19 +71,6 @@ export const validatedPeople = [
   { name: "Unknown person", enrollment: "Acknowledged", date: "Aug 26", needsValidation: true },
 ];
 
-export const attendance = [
-  { employee: "Aarti Prajapati", empId: "0J01", timeIn: "09:05 AM", timeOut: "-", timeStay: "2h 04m", arrival: "On time", status: "Present" },
-  { employee: "Kashish Yadav", empId: "0J01", timeIn: "-", timeOut: "-", timeStay: "-", arrival: "-", status: "Absent" },
-  { employee: "Mukul Singh", empId: "0J01", timeIn: "09:05 AM", timeOut: "-", timeStay: "2h 04m", arrival: "Late arrival", status: "On site" },
-];
-
-export const attendanceStats = {
-  present: 25, presentOf: 40,
-  absent: 15,
-  attendancePct: "62.5%",
-  lateArrivals: 2,
-};
-
 export const workforceStats = {
   totalEmployees: 40,
   employeeExited: 2,

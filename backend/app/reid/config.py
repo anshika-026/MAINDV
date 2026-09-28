@@ -7,11 +7,13 @@ they are). Kept as its own module rather than merged into app/config.py so
 the vendored files' `from . import config` resolves unchanged.
 
 The one deliberate default change vs the export: REID_MOT_INTERVAL_SECONDS
-is 1.0, not 3.0. The export was tuned for a reception camera where people
+is 0.5, not 3.0. The export was tuned for a reception camera where people
 linger; at an entry gate someone crosses the frame in a few seconds, and a
 3s cadence would see them once at most — not enough observations to either
 confirm a match (REID_CONFIRMED_MIN_VOTES) or enroll a new identity
-(REID_AUTO_ENROLL_MIN_OBSERVATIONS).
+(REID_AUTO_ENROLL_MIN_OBSERVATIONS). With a counting zone drawn over just the
+doorway a walker is inside it for ~2 s, so even 1.0 left most of them with
+only 2 looks — one short of being enrolled.
 """
 
 import os
@@ -50,6 +52,9 @@ REID_QUALITY_MIN_SCORE = float(os.getenv("REID_QUALITY_MIN_SCORE", "0.55"))
 REID_MIN_BODY_SIZE_PX = int(os.getenv("REID_MIN_BODY_SIZE_PX", "80"))
 REID_BLUR_VARIANCE_FLOOR = float(os.getenv("REID_BLUR_VARIANCE_FLOOR", "80.0"))
 REID_BLUR_VARIANCE_HARD_MIN = float(os.getenv("REID_BLUR_VARIANCE_HARD_MIN", "20.0"))
+# Body boxes shorter than this height:width are skipped entirely (seated,
+# head-only, merged boxes) — see reid_quality.assess.
+REID_MIN_ASPECT_RATIO = float(os.getenv("REID_MIN_ASPECT_RATIO", "1.5"))
 
 # --- Temporal fusion ---
 REID_FUSION_WINDOW = int(os.getenv("REID_FUSION_WINDOW", "5"))
@@ -62,5 +67,15 @@ REID_TRACK_TIMEOUT_SECONDS = float(os.getenv("REID_TRACK_TIMEOUT_SECONDS", "20.0
 REID_AUTO_ENROLL_MIN_OBSERVATIONS = int(os.getenv("REID_AUTO_ENROLL_MIN_OBSERVATIONS", "3"))
 REID_ENROLLMENT_TARGET_EMBEDDINGS = int(os.getenv("REID_ENROLLMENT_TARGET_EMBEDDINGS", "12"))
 
-# --- Cadence (see module docstring for why 1.0 here) ---
-REID_MOT_INTERVAL_SECONDS = float(os.getenv("REID_MOT_INTERVAL_SECONDS", "1.0"))
+# --- Learning new views of known people (footfall._record) ---
+# A confirmed match that scored below REID_LEARN_BELOW_SIMILARITY is a view
+# the gallery doesn't cover well yet (new angle, other gate), so its
+# embedding is added to that person — up to REID_MAX_EMBEDDINGS_PER_PERSON.
+# Measured live: one person's views of themselves fell below 0.55 one time
+# in ten, so a person enrolled from one angle often failed to match from
+# another and got a second identity.
+REID_LEARN_BELOW_SIMILARITY = float(os.getenv("REID_LEARN_BELOW_SIMILARITY", "0.88"))
+REID_MAX_EMBEDDINGS_PER_PERSON = int(os.getenv("REID_MAX_EMBEDDINGS_PER_PERSON", "30"))
+
+# --- Cadence (see module docstring for why 0.5 here) ---
+REID_MOT_INTERVAL_SECONDS = float(os.getenv("REID_MOT_INTERVAL_SECONDS", "0.5"))
