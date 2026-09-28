@@ -33,3 +33,4 @@ threadpoolctl==3.6.0
 PyJWT==2.14.0
 qrcode==8.2
 pillow==12.3.0
+python-multipart==0.0.6
