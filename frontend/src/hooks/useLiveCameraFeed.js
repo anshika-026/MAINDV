@@ -1,91 +1,85 @@
 import { useEffect, useRef, useState } from "react";
 import { WS_HOST, WS_PROTOCOL } from "../api/client";
 
-// Box color is company-based, resolved server-side from the recognized
-// employee_id (see employee_directory.py) and sent as det.color on every
-// detection. This is only the fallback for an unrecognized person (no
-// employee_id) or a detection sent by a backend that predates the "color"
-// field — kept visually distinct from every company color so it's never
-// mistaken for one. Never a guessed company. No "Unknown" anywhere (see
-// face_pipeline.py's PersonTrackState: a person with no confident identity
-// is still a real, continuously-tracked person, just without a name
-// attached yet).
-const NEUTRAL_BOX_COLOR = "#6b7280";
+// Placeholder labels that mean "we could not identify this person". None
+// of them are ever rendered — an unrecognized person gets NO overlay at
+// all. Kept as a defensive filter here at the display layer so that a
+// value like "Unknown" arriving from an older recognition component still
+// can't reach the screen.
+const NON_IDENTITY_LABELS = new Set([
+  "unknown",
+  "person",
+  "unidentified",
+  "face",
+  "no match",
+  "no_match",
+]);
 
-// One-off display exception, requested for employee 026 (Mahesh
-// Chaudhary) specifically: his box border is split per-side instead of
-// the normal single company color. Purely a rendering choice — his
-// company/label color (still resolved from det.color, same as everyone
-// else) is untouched, only which color each border segment uses.
-const MAHESH_EMPLOYEE_ID = "026";
-const MAHESH_BORDER_COLORS = { top: "#000000", right: "#2563eb", bottom: "#000000", left: "#f97316" };
-
-// Draws a rectangle as four independently-colored line segments rather
-// than one strokeRect() — still one continuous box, just each side its
-// own color. `lineCap = "square"` extends each segment half a line-width
-// past its endpoint, which is what makes adjoining sides meet cleanly at
-// the corners instead of leaving a notch (butt-capped segments don't
-// cover the corner pixels where two colors meet).
-function drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth) {
-  ctx.lineWidth = lineWidth;
-  ctx.lineCap = "square";
-  const sides = [
-    [x1, y1, x2, y1, MAHESH_BORDER_COLORS.top],
-    [x2, y1, x2, y2, MAHESH_BORDER_COLORS.right],
-    [x2, y2, x1, y2, MAHESH_BORDER_COLORS.bottom],
-    [x1, y2, x1, y1, MAHESH_BORDER_COLORS.left],
-  ];
-  for (const [sx1, sy1, sx2, sy2, sideColor] of sides) {
-    ctx.strokeStyle = sideColor;
-    ctx.beginPath();
-    ctx.moveTo(sx1, sy1);
-    ctx.lineTo(sx2, sy2);
-    ctx.stroke();
-  }
+// The overlay is identity-only by design. Person detection and tracking
+// keep running in the backend and the detection payload still carries
+// bboxes and colours (other functionality depends on both — see
+// face_pipeline.py's _update_person_overlay), but the generic person
+// rectangle is never drawn: nothing appears on screen unless face
+// recognition produced a confident identity. Returns the name to
+// display, or null when there is nothing to show.
+function recognizedNameOf(det) {
+  if (!det || !det.employee_id) return null;
+  const name = typeof det.name === "string" ? det.name.trim() : "";
+  if (!name) return null;
+  if (NON_IDENTITY_LABELS.has(name.toLowerCase())) return null;
+  return name;
 }
 
-// Draws one PERSON's box (backend already sends the full body box, not a
-// face box — see face_pipeline.py's _update_person_overlay) + a compact
-// name-or-"Person" label directly onto the video canvas, in the same pixel
-// coordinate space the backend's bbox is already in (camera_stream.py
-// feeds face_pipeline the exact frame it also JPEG-encodes for /ws/live —
-// no resizing in between), so this needs no scaling math even though the
-// canvas itself is stretched via CSS.
-function drawDetection(ctx, det) {
-  const [x1, y1, x2, y2] = det.bbox;
-  const color = det.employee_id ? det.color || NEUTRAL_BOX_COLOR : NEUTRAL_BOX_COLOR;
-  const lineWidth = Math.max(2, (x2 - x1) * 0.01);
-  if (det.employee_id === MAHESH_EMPLOYEE_ID) {
-    drawFourSidedBox(ctx, x1, y1, x2, y2, lineWidth);
-  } else {
-    ctx.lineWidth = lineWidth;
-    ctx.strokeStyle = color;
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-  }
+// Only ever used if a detection somehow arrives without a colour — the
+// same neutral this file has always used for that case. The real colours
+// come from the employee -> company -> colour pipeline in
+// employee_directory.py (resolved server-side, sent as det.color); this
+// file never picks, overrides or maps a colour itself.
+const FALLBACK_LABEL_COLOR = "#6b7280";
 
-  // Plain name (or "Person") — no confidence percentage or extra text, to
-  // stay a compact label rather than a UI badge.
-  const label = det.employee_id ? det.name || det.employee_id : "Person";
+// Draws ONLY a recognized person's name, in the same pixel coordinate
+// space the backend's bbox is already in (camera_stream.py feeds
+// face_pipeline the exact frame it also JPEG-encodes for /ws/live — no
+// resizing in between), so this needs no scaling math even though the
+// canvas itself is stretched via CSS.
+//
+// The generic person rectangle is deliberately NOT drawn — the bbox is
+// used purely to position the name over that person. The name keeps the
+// existing colour-coded label styling (company colour behind white text),
+// which is what makes every company colour legible over live video,
+// including Shaurrya's #000000.
+function drawDetection(ctx, det) {
+  const name = recognizedNameOf(det);
+  if (!name) return; // unrecognized -> intentionally nothing rendered
+
+  // That person's existing company colour, exactly as assigned server-side.
+  const color = det.color || FALLBACK_LABEL_COLOR;
+
+  const [x1, y1, x2] = det.bbox;
   ctx.font = "600 13px sans-serif";
   const padding = 4;
-  const textWidth = ctx.measureText(label).width;
   const labelHeight = 18;
+  const labelWidth = ctx.measureText(name).width + padding * 2;
+  // Centred over the person rather than pinned to the (now invisible)
+  // box's left edge, so the name still reads as belonging to them.
+  const labelX = (x1 + x2) / 2 - labelWidth / 2;
   const labelY = y1 - labelHeight >= 0 ? y1 - labelHeight : y1;
+
   ctx.fillStyle = color;
-  ctx.fillRect(x1, labelY, textWidth + padding * 2, labelHeight);
+  ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(label, x1 + padding, labelY + labelHeight - 5);
+  ctx.fillText(name, labelX + padding, labelY + labelHeight - 5);
 }
 
 // Opens the backend's per-camera live-view websocket (camera_stream.py) and
 // paints each incoming JPEG frame onto a canvas, plus a second websocket
-// (main.py's /ws/detections) for the live PERSON overlay — a full-body box
-// per detected person, labeled with their recognized name once face
-// recognition is confident and stable, or "Person" otherwise. A person's
-// box never depends on their face being visible (see face_pipeline.py's
-// person-first architecture). Shared by the grid tile and the enlarged
-// viewer modal so both draw from their own independent connections using
-// identical wiring.
+// (main.py's /ws/detections) for the live IDENTITY overlay. The backend
+// still detects and tracks every person and still sends their bbox; this
+// overlay deliberately renders only the names of people face recognition
+// has confidently and stably identified, and renders nothing at all for
+// anyone it hasn't (see drawDetection). Shared by the grid tile and the
+// enlarged viewer modal so both draw from their own independent
+// connections using identical wiring.
 export default function useLiveCameraFeed(camera) {
   const canvasRef = useRef(null);
   const [status, setStatus] = useState(camera?.isConfigured ? "connecting" : "offline");

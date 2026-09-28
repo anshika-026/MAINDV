@@ -140,7 +140,15 @@ class CameraStream:
                         self._feed_pipeline, frame, self.has_real_viewer()
                     )
 
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                # Quality 70 rather than 80: these are full 1920x1080 frames,
+                # so the encode itself and the ~350KB/frame it produced were
+                # both meaningful costs on a CPU-bound box streaming three
+                # cameras. 70 cuts encode time and bytes per frame with no
+                # visible difference on a live view, and — unlike resizing —
+                # leaves the frame's pixel dimensions alone, so the bboxes
+                # the overlay positions names from stay in the same
+                # coordinate space (see useLiveCameraFeed.js).
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if not ok:
                     continue
                 data = buf.tobytes()

@@ -93,15 +93,22 @@ export async function signup(payload) {
 
 // ---- Dashboard ---------------------------------------------------------
 export async function getDashboardStats() {
-  // Only the camera count is real; the rest (people/footfall/alerts/AI
+  // Camera count and footfall are real; the rest (people/alerts/AI
   // insights) has no backend pipeline yet, so it stays mock.
-  const cameras = await getCameras();
+  const [cameras, footfall] = await Promise.all([getCameras(), getFootfallSummary().catch(() => null)]);
   const online = cameras.filter((c) => c.status === "Active").length;
+  const gates = footfall?.gates.length ?? 0;
   return {
     ...mock.dashboardStats,
     admin: {
       ...mock.dashboardStats.admin,
       camerasOnline: { value: `${online} / ${cameras.length}`, sub: "" },
+      footfallToday: footfall
+        ? {
+            value: footfall.unique_today,
+            sub: gates ? `across ${gates} gate${gates === 1 ? "" : "s"} · avg ${footfall.avg_per_gate}/gate` : "no gate cameras set",
+          }
+        : { value: "—", sub: "footfall unavailable" },
     },
   };
 }
@@ -222,7 +229,114 @@ export async function deleteSite(id) {
 // person's name, unique employee ID and reference sample photos.
 const FACES_API_BASE = "http://13.61.58.14";
 
+// ---- Manually enrolled Identity people ----------------------------------
+// People added by hand on the Identity page are saved in OUR backend's
+// database (face_db's employees table, manually_added=1) rather than the
+// external roster service, which has no write API. These four functions are
+// the whole persistence path: save the record, upload each face photo
+// (stored on disk + embedded into face_embeddings by /faces/enroll), read
+// them back after a refresh, and fetch a saved photo for display.
+
+export function saveIdentityPerson({ employeeId, name, department, personType }) {
+  return facesRequest("/people", {
+    method: "POST",
+    body: JSON.stringify({
+      employee_id: employeeId,
+      name,
+      department: department || null,
+      person_type: personType || null,
+    }),
+  });
+}
+
+export function getIdentityPeople() {
+  return facesRequest("/people");
+}
+
+// Behavior Analytics: posts one laptop-webcam frame and gets back what the
+// EXISTING detectors saw in it (person/face counts from the same YOLO models
+// the live cameras use, plus the existing expression service). Nothing about
+// the RTSP camera pipeline is involved. Same multipart shape as
+// enrollFacePhoto — no Content-Type header, so the browser sets the boundary.
+export async function analyzeBehaviorFrame(blob) {
+  const body = new FormData();
+  body.append("frame", blob, "frame.jpg");
+  const res = await fetch(`${BASE_URL}/faces/behavior/analyze`, {
+    method: "POST",
+    body,
+    headers: { ...authHeaders() },
+  });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || `Analyze failed (${res.status})`);
+  }
+  return res.json();
+}
+
+// multipart/form-data — deliberately does NOT set Content-Type, so the
+// browser adds the multipart boundary itself. Surfaces the backend's real
+// `detail` (e.g. "No face detected in photo") so the UI can show why an
+// upload failed instead of reporting a success it didn't get.
+export async function enrollFacePhoto(employeeId, blob, filename = "face.jpg") {
+  const body = new FormData();
+  body.append("person_id", employeeId);
+  body.append("photo", blob, filename);
+  const res = await fetch(`${BASE_URL}/faces/enroll`, {
+    method: "POST",
+    body,
+    headers: { ...authHeaders() },
+  });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || `Photo upload failed (${res.status})`);
+  }
+  return res.json();
+}
+
+// Same reasoning as fetchTrainingImageObjectUrl — this endpoint needs an
+// admin Bearer token, which a plain <img src> cannot send.
+export async function fetchIdentityPhotoObjectUrl(embeddingId) {
+  const res = await fetch(`${BASE_URL}/faces/people/photo/${embeddingId}`, {
+    headers: { ...authHeaders() },
+  });
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (!res.ok) throw new Error(`Could not load photo (${res.status})`);
+  return URL.createObjectURL(await res.blob());
+}
+
+// Reads the hand-entered people back out of our database and shapes them
+// like the external roster rows, so getPeople() can present one merged
+// list. Photo object URLs are resolved here so a saved face sample still
+// renders after a refresh.
+async function getLocalIdentityRows() {
+  const people = await getIdentityPeople();
+  return Promise.all(
+    people.map(async (p) => ({
+      name: p.name,
+      employeeId: p.employee_id,
+      department: p.department || undefined,
+      type: p.person_type || "Employee",
+      designs: p.embedding_count,
+      faceEnrolled: p.embedding_count > 0,
+      enrollment: p.embedding_count > 0 ? "Enrolled" : "Not enrolled",
+      manuallyAdded: true,
+      photos: await Promise.all(
+        (p.photos || []).map(async (ph) => ({
+          id: `local-${ph.id}`,
+          url: await fetchIdentityPhotoObjectUrl(ph.id).catch(() => null),
+        }))
+      ),
+    }))
+  );
+}
+
 export async function getPeople() {
+  // Hand-entered people come from our own database and must show up even
+  // if the external roster service is unreachable — they're independent
+  // sources, so a failure of one must not hide the other.
+  const localRows = await getLocalIdentityRows().catch(() => []);
   try {
     const res = await fetch(`${FACES_API_BASE}/api/faces`);
     if (!res.ok) throw new Error(`Faces API error ${res.status}`);
@@ -238,7 +352,7 @@ export async function getPeople() {
       // Best-effort — People page still works with the external service's
       // own (possibly stale) IDs if this backend is briefly unreachable.
     }
-    return rows.map((r) => ({
+    const externalRows = rows.map((r) => ({
       name: r.name,
       employeeId: overrides[r.name] || r.employee_id || "-",
       designs: r.sample_count,
@@ -246,8 +360,36 @@ export async function getPeople() {
       enrollment: r.sample_count > 0 ? "Enrolled" : "Not enrolled",
       photos: (r.photo_urls || []).map((path, i) => ({ id: `${r.name}-${i}`, url: `${FACES_API_BASE}${path}` })),
     }));
+    // Merge by employee ID rather than dropping either side. When both
+    // sources describe the same ID it's the same person — someone filled
+    // in details locally for somebody the roster service also knows — so
+    // the hand-entered values win (they were typed deliberately, and the
+    // external service has no write API to push them back to), while the
+    // roster's reference photos are kept if the local record has none.
+    // Discarding the local row here instead is exactly what made a saved
+    // person look like it "didn't save": the record was in the database
+    // but never reached the list.
+    const byExternalId = new Map(externalRows.map((r) => [r.employeeId, r]));
+    const mergedLocal = localRows.map((local) => {
+      const external = byExternalId.get(local.employeeId);
+      if (!external) return local;
+      const photos = local.photos?.length ? local.photos : external.photos;
+      return {
+        ...external,
+        ...local,
+        photos,
+        designs: local.designs || external.designs,
+        enrollment: (local.designs || external.designs) > 0 ? "Enrolled" : "Not enrolled",
+      };
+    });
+    // Locally-saved people first — a just-added person should be visible
+    // without scrolling.
+    const localIds = new Set(localRows.map((r) => r.employeeId));
+    return [...mergedLocal, ...externalRows.filter((r) => !localIds.has(r.employeeId))];
   } catch {
-    return mock.people;
+    // External roster unreachable — still show what we have saved locally,
+    // and only fall back to mock data when there is nothing real at all.
+    return localRows.length ? localRows : mock.people;
   }
 }
 // Persists an edited employee ID for a person from the People page — see
@@ -287,13 +429,11 @@ export async function getDeskAnalytics() {
 }
 
 // ---- Footfall ------------------------------------------------------------
-export async function getFootfallStats() {
-  // return request("/footfall/stats");
-  return Promise.resolve(mock.footfallStats);
-}
-export async function getFootfallVisitors() {
-  // return request("/footfall/visitors");
-  return Promise.resolve(mock.footfallVisitors);
+// Unique people across every entry gate — each person counted once no
+// matter which gate(s) they used (backend/app/footfall.py). Gate cameras
+// are the ones with purpose "Entry/Exit" in Camera Management.
+export async function getFootfallSummary() {
+  return request("/footfall/summary");
 }
 
 // ---- Intrusion -----------------------------------------------------------

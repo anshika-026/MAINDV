@@ -92,6 +92,27 @@ def init_face_tables():
         )
     """)
 
+    # Added later, for people enrolled by hand on the Identity page rather
+    # than synced from the external roster service. Same table on purpose —
+    # there is one local employee roster, not a second parallel one — so a
+    # manually added person is a normal employees row that simply carries
+    # these extra Identity fields. `manually_added` is the important one:
+    # sync_employees() prunes rows the external service no longer reports
+    # (see delete_employees_not_in), which would otherwise silently delete
+    # every hand-entered person on the next sync. SQLite has no
+    # "ADD COLUMN IF NOT EXISTS"; catching the duplicate-column error is the
+    # standard idempotent pattern, already used for training_runs above.
+    for _col, _decl in (
+        ("department", "TEXT"),
+        ("person_type", "TEXT"),
+        ("manually_added", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at", "REAL"),
+    ):
+        try:
+            cur.execute(f"ALTER TABLE employees ADD COLUMN {_col} {_decl}")
+        except sqlite3.OperationalError:
+            pass
+
     # The People page's roster (name, photos, enrollment) is read live from a
     # separate external service (see face_routes.py/client.js) that this app
     # has no write access to — there's no update API for it. Its employee_id
@@ -352,6 +373,101 @@ def list_employees() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def upsert_manual_person(
+    employee_id: str,
+    name: str,
+    department: str | None = None,
+    person_type: str | None = None,
+) -> dict:
+    """Create-or-update one hand-entered Identity person, in the SAME
+    employees table the rest of this app already uses as the local roster.
+
+    This is the persistence the Identity page's add/edit flow writes
+    through, so a manually added person survives a page refresh, a backend
+    restart and a reboot. Marked manually_added=1 so delete_employees_not_in
+    can never prune them for being absent from the external roster service.
+
+    Editing an existing person only overwrites the fields given: passing
+    department=None leaves whatever was stored, so an edit that changes
+    just the name can't blank the rest of the record.
+    """
+    conn = get_conn()
+    try:
+        existing = conn.execute(
+            "SELECT employee_id, name, department, person_type, created_at FROM employees WHERE employee_id = ?",
+            (employee_id,),
+        ).fetchone()
+        now = time.time()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO employees (employee_id, name, department, person_type, manually_added, created_at)
+                   VALUES (?, ?, ?, ?, 1, ?)""",
+                (employee_id, name, department, person_type, now),
+            )
+        else:
+            conn.execute(
+                """UPDATE employees
+                   SET name = ?,
+                       department = COALESCE(?, department),
+                       person_type = COALESCE(?, person_type),
+                       manually_added = 1,
+                       created_at = COALESCE(created_at, ?)
+                   WHERE employee_id = ?""",
+                (name, department, person_type, now, employee_id),
+            )
+        conn.commit()
+        row = conn.execute(
+            """SELECT employee_id, name, department, person_type, manually_added, created_at
+               FROM employees WHERE employee_id = ?""",
+            (employee_id,),
+        ).fetchone()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_manual_people() -> list[dict]:
+    """Hand-entered Identity people only (manually_added=1), each with how
+    many enrolled face embeddings they currently have — that count is what
+    makes them recognisable live via the enrollment-gallery fallback in
+    face_pipeline._identify_for_overlay()."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT e.employee_id, e.name, e.department, e.person_type, e.created_at,
+                  (SELECT COUNT(*) FROM face_embeddings fe WHERE fe.person_id = e.employee_id) AS embedding_count
+           FROM employees e
+           WHERE e.manually_added = 1
+           ORDER BY e.created_at DESC, e.employee_id"""
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_person_embeddings(person_id: str) -> list[dict]:
+    """The saved reference images behind a person's enrollment — id plus
+    the on-disk path written by POST /api/faces/enroll, newest first."""
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, source_image_path, enrolled_at FROM face_embeddings
+           WHERE person_id = ? ORDER BY enrolled_at DESC, id DESC""",
+        (person_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_embedding_row(embedding_id: int) -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, person_id, source_image_path FROM face_embeddings WHERE id = ?", (embedding_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def set_person_employee_id(name: str, employee_id: str) -> None:
     conn = get_conn()
     conn.execute(
@@ -386,21 +502,31 @@ def delete_employees_not_in(employee_ids: set[str]) -> int:
     correct (the external service really has zero IDs) — this will delete
     every local row in that case. sync_employees() in face_training_routes.py
     guards against calling this with an accidentally-empty set from a
-    malformed/partial API response."""
+    malformed/partial API response.
+
+    NEVER prunes a manually_added row. Those are people entered by hand on
+    the Identity page, so the external roster service has no idea they
+    exist and would report them as "no longer present" on every single
+    sync — silently deleting the record (and with it the roster entry
+    behind their enrolled face embeddings) the first time anyone opened
+    the labeling page. Their enrollment is meant to be permanent, so the
+    prune only ever applies to rows this app pulled FROM that service."""
     conn = get_conn()
     if not employee_ids:
-        n = conn.execute("SELECT COUNT(*) AS c FROM employees").fetchone()["c"]
-        conn.execute("DELETE FROM employees")
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM employees WHERE manually_added = 0"
+        ).fetchone()["c"]
+        conn.execute("DELETE FROM employees WHERE manually_added = 0")
     else:
         placeholders = ",".join("?" * len(employee_ids))
         rows = conn.execute(
-            f"SELECT employee_id FROM employees WHERE employee_id NOT IN ({placeholders})",
+            f"SELECT employee_id FROM employees WHERE manually_added = 0 AND employee_id NOT IN ({placeholders})",
             tuple(employee_ids),
         ).fetchall()
         n = len(rows)
         if n:
             conn.execute(
-                f"DELETE FROM employees WHERE employee_id NOT IN ({placeholders})",
+                f"DELETE FROM employees WHERE manually_added = 0 AND employee_id NOT IN ({placeholders})",
                 tuple(employee_ids),
             )
     conn.commit()

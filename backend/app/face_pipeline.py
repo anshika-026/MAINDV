@@ -53,6 +53,7 @@ import insightface
 
 from app import face_db
 from app import employee_directory
+from app import expression
 
 log = logging.getLogger("face_pipeline")
 
@@ -181,13 +182,20 @@ CLASSIFIER_MIN_PROBA = float(os.environ.get("FACE_CLASSIFIER_MIN_PROBA", "0.6"))
 
 # How often (in *processed*, i.e. already-throttled-to-SAMPLE_FPS frames) a
 # still-active person track gets its live-overlay identity re-classified —
-# see _update_person_identity(). At SAMPLE_FPS=3 this is roughly once per
-# second per visible face; deliberately not every frame, since embedding+predict_proba
-# is the expensive step and doing it per-frame-per-track would multiply CPU
-# cost for no visible UX benefit (see FACE_TRAINING.md's CPU guidance). Only
-# runs at all once a classifier has actually been trained — before that,
-# zero extra cost is added by this feature.
-LIVE_CLASSIFY_INTERVAL_FRAMES = int(os.environ.get("FACE_LIVE_CLASSIFY_INTERVAL_FRAMES", "3"))
+# see _update_person_identity(). embedding+predict_proba is the expensive
+# step, so this is deliberately not every frame; it only runs at all once a
+# classifier has been trained.
+#
+# Set to match PERSON_DETECT_INTERVAL_FRAMES so a classify attempt happens
+# on EVERY overlay pass rather than every other one. At 3 the gap landed
+# just above the 2-frame overlay cadence, so each track was only
+# classified every ~1.33s, and RECOGNITION_STABILITY_FRAMES=2 agreeing
+# reads meant a name took ~2.7s to appear. At 2 that halves to ~0.67s per
+# read, so a name shows in ~1.3s — without weakening the stability vote or
+# the confidence threshold, which both still have to be satisfied. The
+# extra CPU this costs is paid for by the less frequent rescue sweep (see
+# PERSON_RESCUE_INTERVAL_FRAMES).
+LIVE_CLASSIFY_INTERVAL_FRAMES = int(os.environ.get("FACE_LIVE_CLASSIFY_INTERVAL_FRAMES", "2"))
 
 # --- Person-first live overlay (separate from the face-track pipeline
 # above, which keeps building the training/review dataset exactly as
@@ -249,12 +257,21 @@ PERSON_RESCUE_WEIGHTS = os.environ.get("PERSON_RESCUE_WEIGHTS", str(_MODELS_DIR 
 
 # In raw frame_idx units (same units as PERSON_DETECT_INTERVAL_FRAMES), not
 # calls-to-_update_person_overlay units. Must be a multiple of
-# PERSON_DETECT_INTERVAL_FRAMES. 6 at SAMPLE_FPS=3 -> a rescue sweep every
-# ~2s — measured at ~1.2s/call on this box, so this adds roughly
-# 1.2s/2s ≈ 0.6 CPU-core-seconds/sec per camera on top of the fast pass's
-# existing ~0.44 — a real, bounded increase, not the ~4x a full switch to
-# yolov8s at the fast cadence would cost.
-PERSON_RESCUE_INTERVAL_FRAMES = int(os.environ.get("PERSON_RESCUE_INTERVAL_FRAMES", "6"))
+# PERSON_DETECT_INTERVAL_FRAMES. Measured at ~1.2s/call on this box, so at
+# 6 (a sweep every ~2s at SAMPLE_FPS=3) it was costing ~0.6 CPU-core-
+# seconds per second PER CAMERA — with three cameras running that is
+# roughly 1.8 of this machine's 8 cores spent on the rescue model alone,
+# on a box already sitting at 100% CPU. That starvation is what held live
+# video down to ~1.8fps against an 8fps target and slowed every other
+# pass, including recognition.
+#
+# 12 halves that cost (a sweep every ~4s) and buys back the headroom that
+# makes the video smoother AND pays for the faster classify cadence above.
+# The tradeoff is bounded and only affects people the FAST pass misses
+# entirely — typically someone seated/back-facing and motionless — who now
+# get picked up within ~4s instead of ~2s. Normal walking detection and
+# tracking are driven entirely by the fast yolov8n pass and are unchanged.
+PERSON_RESCUE_INTERVAL_FRAMES = int(os.environ.get("PERSON_RESCUE_INTERVAL_FRAMES", "12"))
 
 # A rescue-pass box counts as "already found" (and is dropped, not added
 # as a duplicate track) if it overlaps an already-tracked person's current
@@ -298,11 +315,39 @@ PERSON_TRACKER_MATCH_THRESHOLD = float(os.environ.get("PERSON_TRACKER_MATCH_THRE
 # path is not the failure mode this covers.
 PERSON_TRACK_HANDOFF_IOU = float(os.environ.get("PERSON_TRACK_HANDOFF_IOU", "0.4"))
 
-# How long a committed identity stays displayed after face recognition last
-# confirmed it, before the label falls back to the plain "Person" state —
-# the "short temporal grace period" that stops the name flickering the
-# instant a face turns away or gets briefly occluded.
-IDENTITY_GRACE_SECONDS = float(os.environ.get("IDENTITY_GRACE_SECONDS", "8"))
+# How often a track's facial expression is re-classified, in the same
+# frame_idx units as LIVE_CLASSIFY_INTERVAL_FRAMES. Deliberately much less
+# frequent than identity: a mood changes on human timescales, and this is
+# an extra model on a CPU-bound box, so it runs roughly every ~2s per track
+# instead of every ~0.67s. Identity recognition keeps its own cadence
+# untouched — expression only ever piggybacks on a crop that was already
+# computed for the embedding.
+EXPRESSION_INTERVAL_FRAMES = int(os.environ.get("EXPRESSION_INTERVAL_FRAMES", "6"))
+
+# How long a committed identity stays attached to its person track after
+# face recognition last confirmed it — the temporal grace period that stops
+# a name flickering off the instant a face turns away or gets briefly
+# occluded.
+#
+# Raised from 8s after measuring what actually reaches the overlay: with
+# several people in frame, each recognised person held their name for only
+# 1-9% of a 70s window, and names kept vanishing while that same person was
+# still being tracked. The cause is not a cap on how many people can be
+# named (there is none anywhere) — it is that a confident identity only
+# commits when a face is both detected AND classified above
+# CLASSIFIER_MIN_PROBA twice in a row, which at this camera distance
+# happens in bursts. Between bursts an 8s window expired, so names dropped
+# and reappeared and rarely coexisted.
+#
+# The identity belongs to the TRACK, and the track staying alive is
+# ByteTrack asserting it is still the same body, so holding the last
+# confidently-established identity for as long as that track lives is the
+# correct behaviour — PERSON_TRACK_MAX_AGE already bounds how long a track
+# survives without being re-detected, and PERSON_TRACK_HANDOFF_IOU retires
+# a track the moment a new one supersedes it. This stays a bounded value
+# rather than "forever" so a track that somehow drifts cannot keep a stale
+# name indefinitely.
+IDENTITY_GRACE_SECONDS = float(os.environ.get("IDENTITY_GRACE_SECONDS", "30"))
 
 # Consecutive confident classifier reads of the SAME candidate identity
 # required before a person track's displayed identity is committed or
@@ -350,6 +395,10 @@ class PersonTrackState:
     pending_identity: str | None = None   # stability-vote candidate, not yet committed
     pending_count: int = 0
     last_classify_frame: int = -999_999
+    # Expression is advisory metadata only — it is never read by any
+    # identity decision above, so a missing or failed mood can't change
+    # who this person is (see expression.py).
+    last_expression_frame: int = -999_999
 
 
 class CameraFacePipeline:
@@ -463,8 +512,13 @@ class CameraFacePipeline:
 
     def _refresh_gallery(self):
         # Reload the enrolled embeddings every 30s rather than per-frame.
+        # Interval-only, deliberately not "...or the cache is empty": an
+        # empty gallery is a normal state (nobody enrolled yet), and the
+        # live overlay path now consults this too, so re-querying whenever
+        # it's empty would mean a DB round-trip per recognition cycle per
+        # camera forever.
         now = time.time()
-        if now - self._gallery_loaded_at > 30 or not self._gallery_cache:
+        if now - self._gallery_loaded_at > 30:
             self._gallery_cache = face_db.get_all_embeddings()
             self._gallery_loaded_at = now
 
@@ -781,6 +835,11 @@ class CameraFacePipeline:
             # never a guessed company.
             name, color = employee_directory.get_display(display_identity)
 
+            # Advisory only, and resolved independently of identity — a
+            # track with no expression keeps its name, and a track with an
+            # expression but no confident identity still shows nothing.
+            expr, expr_conf = expression.service.get(self.camera_id, track_id)
+
             live_this_frame.append({
                 "track_id": track_id,
                 "bbox": list(pstate.bbox),
@@ -788,6 +847,8 @@ class CameraFacePipeline:
                 "name": name,
                 "color": color,
                 "confidence": pstate.identity_confidence if display_identity else 0.0,
+                "expression": expr,
+                "expression_confidence": expr_conf,
             })
 
         # Replaced wholesale each frame (not merged) — a person who's
@@ -799,15 +860,18 @@ class CameraFacePipeline:
 
         for tid in stale_persons:
             self.person_tracks.pop(tid)
+            # Don't let expression results accumulate for tracks that are gone.
+            expression.service.forget(self.camera_id, tid)
 
     def _update_person_identity(self, pstate: PersonTrackState, frame: np.ndarray, face_row: np.ndarray) -> None:
         """Throttled (LIVE_CLASSIFY_INTERVAL_FRAMES) classifier read on the
         face found inside this person's box, with a stability vote before
         committing/switching pstate.current_identity — see PersonTrackState
-        docstring. No-op entirely if no classifier has been trained yet
-        (zero extra CPU cost before that point, same as before)."""
-        clf = self._get_classifier()
-        if clf is None:
+        docstring. No-op entirely when there is nothing to match against —
+        neither a trained classifier nor any enrolled face — so the
+        embedding cost is only paid once at least one of the two exists."""
+        self._refresh_gallery()
+        if self._get_classifier() is None and not self._gallery_cache:
             return
         if self.frame_idx - pstate.last_classify_frame < LIVE_CLASSIFY_INTERVAL_FRAMES:
             return
@@ -819,23 +883,32 @@ class CameraFacePipeline:
         crop = frame[py1:py2, px1:px2]
         if crop.size == 0:
             return
+
+        # Reuse this exact crop for expression before spending it on the
+        # embedding — same frame, same face, same track_id, so no second
+        # detection pass anywhere. submit() is fire-and-forget and drops
+        # the crop if its worker is busy, so this line cannot slow down
+        # recognition below it (see expression.py).
+        if self.frame_idx - pstate.last_expression_frame >= EXPRESSION_INTERVAL_FRAMES:
+            pstate.last_expression_frame = self.frame_idx
+            expression.service.submit(self.camera_id, pstate.track_id, crop)
+
         embedding = self._embed(crop)
         if embedding is None:
             return
 
-        proba = clf.predict_proba(embedding.reshape(1, -1))[0]
-        best_idx = int(np.argmax(proba))
-        score = float(proba[best_idx])
-        if score < CLASSIFIER_MIN_PROBA:
-            # Not confident this cycle. Does NOT clear an already-committed
-            # identity (the grace period, checked at display time, handles
-            # that decay) — just resets the stability vote so a run of weak
-            # reads can't slowly accumulate into a wrong switch later.
+        predicted, score = self._identify_for_overlay(embedding)
+        if predicted is None:
+            # Not confident this cycle, from either source. Does NOT clear
+            # an already-committed identity (the grace period, checked at
+            # display time, handles that decay) — just resets the stability
+            # vote so a run of weak reads can't slowly accumulate into a
+            # wrong switch later. No "Unknown"/"Person" is ever produced
+            # here: a failed recognition stays absent, and the overlay
+            # renders nothing for it.
             pstate.pending_identity = None
             pstate.pending_count = 0
             return
-
-        predicted = str(clf.classes_[best_idx])
 
         if predicted == pstate.current_identity:
             # Already showing this person — just refresh the grace timer
@@ -854,6 +927,51 @@ class CameraFacePipeline:
             pstate.current_identity = predicted
             pstate.identity_confidence = score
             pstate.last_recognized_time = time.time()
+
+    def _identify_for_overlay(self, embedding: np.ndarray) -> tuple[str | None, float]:
+        """Identity for ONE face embedding on the live overlay path, using
+        both recognition sources in priority order:
+
+        1. The trained classifier — the primary path, unchanged. Accepted
+           only at/above CLASSIFIER_MIN_PROBA.
+        2. Fallback: nearest-neighbour cosine match against the local
+           Identity enrollment gallery (face_db's face_embeddings — the
+           same storage POST /api/faces/enroll writes to, reused here
+           rather than introducing a second gallery). Accepted only
+           at/above MATCH_THRESHOLD. This is what lets someone who IS
+           enrolled on the Identity page but has too few labelled camera
+           captures to be one of the classifier's classes still be
+           recognised live.
+
+        Returns (None, 0.0) when neither source is confident enough. That
+        is a real "no identity" answer and is deliberately never converted
+        into an "Unknown"/"Person" label — the caller leaves the track
+        unidentified and the overlay renders nothing for it.
+
+        Distinct from _match() (used by the capture/review path), which
+        treats the gallery as the mode to use *instead of* a classifier
+        when none has been trained; here the gallery is an additional
+        source consulted whenever the classifier isn't sure.
+        """
+        clf = self._get_classifier()
+        if clf is not None:
+            proba = clf.predict_proba(embedding.reshape(1, -1))[0]
+            best_idx = int(np.argmax(proba))
+            score = float(proba[best_idx])
+            if score >= CLASSIFIER_MIN_PROBA:
+                return str(clf.classes_[best_idx]), score
+
+        self._refresh_gallery()
+        best_person, best_score = None, -1.0
+        for entry in self._gallery_cache:
+            gallery_vec = np.array(entry["embedding"], dtype=np.float32)
+            score = float(np.dot(embedding, gallery_vec))  # cosine sim (both normalized)
+            if score > best_score:
+                best_score = score
+                best_person = entry["person_id"]
+        if best_person is not None and best_score >= MATCH_THRESHOLD:
+            return best_person, best_score
+        return None, 0.0
 
     def get_live_detections(self) -> list[dict]:
         """Snapshot for the /ws/detections/{camera_id} route — see the

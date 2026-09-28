@@ -23,6 +23,7 @@ const EMPTY_FORM = {
   type: "Employee",
   firstName: "",
   lastName: "",
+  employeeId: "",
   department: departments[0],
   host: "",
   from: "",
@@ -57,6 +58,10 @@ export default function People() {
   const [step, setStep] = useState(1);
   const [form, setForm] = useState(EMPTY_FORM);
   const [newPerson, setNewPerson] = useState(null);
+  // Real save state — the wizard/modal shows the backend's own error and
+  // stays open on failure rather than reporting a success that didn't happen.
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   // Edit modal — mirrors the add-person wizard (details, then face enrollment)
   const [editing, setEditing] = useState(null);
@@ -104,6 +109,8 @@ export default function People() {
     setStep(1);
     setForm(EMPTY_FORM);
     setNewPerson(null);
+    setSaving(false);
+    setSaveError("");
   }
 
   function openAdd() {
@@ -126,38 +133,112 @@ export default function People() {
 
   // Last name is NOT required — real synced employee records are often a
   // single word (e.g. "Priya"), and requiring one would leave the Continue
-  // button permanently disabled for them.
+  // button permanently disabled for them. An Employee ID IS required for
+  // employees: it's the key the database record, the enrolled embeddings
+  // and live recognition all share.
   const canContinue =
-    form.firstName.trim() && (form.type === "Employee" ? form.department : form.host.trim());
+    form.firstName.trim() &&
+    (form.type === "Employee" ? form.department && form.employeeId.trim() : form.host.trim());
 
-  function finishEnrollment() {
+  // Reloads the Identity list from the backend. Called after every save so
+  // what the page shows is what the database actually holds, rather than a
+  // local guess that could drift from it.
+  async function refreshEmployees() {
+    const rows = await api.getPeople();
+    setEmployees(
+      rows.map((r, i) => {
+        const merged = { ...(employeeMeta[i] || {}), ...r, type: r.type || "Employee" };
+        return {
+          ...merged,
+          photos: merged.photos && merged.photos.length ? merged.photos : placeholderPhotos(`emp-${i}`, merged.designs),
+        };
+      })
+    );
+  }
+
+  // Persists a hand-entered person: the record goes to the database and
+  // each face photo is uploaded (saved to disk + embedded) before this
+  // reports success. A failure anywhere surfaces the backend's real error
+  // and leaves the wizard open with the user's input intact — it never
+  // shows a success screen for something that wasn't saved.
+  async function finishEnrollment() {
     const name = `${form.firstName} ${form.lastName}`.trim();
-    const enrolled = form.photos.length > 0;
-    const record = {
-      name,
-      photos: form.photos,
-      faceEnrolled: enrolled,
-      designs: form.photos.length,
-      date: "Sep 15",
-      enrollment: enrolled ? "Enrolled" : "Not enrolled",
-      employeeId: form.type === "Employee" ? `EMP-${Math.floor(2200 + Math.random() * 90)}` : "-",
-      syncStatus: "Pending sync",
-      guestOf: form.type === "Guest" ? form.host : undefined,
-      department: form.type === "Employee" ? form.department : undefined,
-      status: "Away",
-      zone: "-",
-      camera: "-",
-      lastSeenDesk: "-",
-      confidence: 0,
-      type: form.type,
-    };
-    if (form.type === "Employee") {
-      setEmployees((prev) => [record, ...prev]);
-    } else {
+    const isEmployee = form.type !== "Guest";
+
+    // A guest isn't an employee record and has no employee ID to key
+    // embeddings on, so it stays local-only exactly as before.
+    if (!isEmployee) {
+      const record = {
+        name,
+        photos: form.photos,
+        faceEnrolled: form.photos.length > 0,
+        designs: form.photos.length,
+        enrollment: form.photos.length > 0 ? "Enrolled" : "Not enrolled",
+        employeeId: "-",
+        guestOf: form.host,
+        status: "Away",
+        zone: "-",
+        camera: "-",
+        lastSeenDesk: "-",
+        confidence: 0,
+        type: form.type,
+      };
       setGuests((prev) => [record, ...prev]);
+      setNewPerson(record);
+      setStep(3);
+      return;
     }
-    setNewPerson(record);
-    setStep(3);
+
+    const employeeId = form.employeeId.trim();
+    setSaving(true);
+    setSaveError("");
+    try {
+      // 1. The person record — committed server-side before this resolves.
+      await api.saveIdentityPerson({
+        employeeId,
+        name,
+        department: form.department,
+        personType: form.type,
+      });
+
+      // 2. Each face photo. FaceEnrollment hands us object URLs, so the
+      //    original bytes are read back out of them here to upload.
+      //    Counted rather than assumed: a photo the backend can't find a
+      //    face in is reported instead of silently dropped.
+      let uploaded = 0;
+      const photoErrors = [];
+      for (const photo of form.photos) {
+        if (!photo.url) continue;
+        try {
+          const blob = await fetch(photo.url).then((r) => r.blob());
+          await api.enrollFacePhoto(employeeId, blob);
+          uploaded += 1;
+        } catch (e) {
+          photoErrors.push(e.message);
+        }
+      }
+
+      // 3. Re-read from the backend so the list reflects stored state.
+      await refreshEmployees();
+
+      setNewPerson({
+        name,
+        employeeId,
+        department: form.department,
+        designs: uploaded,
+        photos: form.photos,
+        enrollment: uploaded > 0 ? "Enrolled" : "Not enrolled",
+        type: form.type,
+      });
+      if (photoErrors.length) {
+        showToast(`Saved, but ${photoErrors.length} photo(s) failed: ${photoErrors[0]}`);
+      }
+      setStep(3);
+    } catch (e) {
+      setSaveError(e.message || "Could not save this person — nothing was stored.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   function deletePerson(list, setList, row) {
@@ -205,7 +286,7 @@ export default function People() {
     editing && editing.firstName.trim() &&
     (editing.type === "Employee" ? editing.department : editing.host.trim());
 
-  function saveEdit() {
+  async function saveEdit() {
     const isEmployee = editing.type !== "Guest";
     const name = `${editing.firstName} ${editing.lastName}`.trim();
     const enrolled = editing.photos.length > 0;
@@ -220,19 +301,55 @@ export default function People() {
     };
     editing.setList((prev) => prev.map((r) => (r === editing.original ? { ...r, ...updated } : r)));
 
-    // The employee ID itself has nowhere else to persist — the external
-    // roster service this page reads from has no update API — so without
-    // this it silently reverted on the next refresh. Keyed on the
-    // ORIGINAL (pre-edit) name, since that's the stable id the override
-    // table and the next getPeople() fetch both match on.
-    if (isEmployee && editing.employeeId.trim() && editing.employeeId !== editing.original.employeeId) {
-      api.setPersonEmployeeId(editing.original.name, editing.employeeId.trim()).catch(() => {
-        showToast("Employee ID could not be saved — try again");
-      });
+    if (!isEmployee) {
+      showToast("Details updated");
+      closeEdit();
+      return;
     }
 
-    showToast("Details updated");
-    closeEdit();
+    const employeeId = editing.employeeId.trim();
+    setSaving(true);
+    setSaveError("");
+    try {
+      // Name and department are persisted through the same record the add
+      // wizard writes, so an edit survives a refresh instead of reverting
+      // to whatever the external roster last reported.
+      if (employeeId) {
+        await api.saveIdentityPerson({
+          employeeId,
+          name,
+          department: editing.department,
+          personType: "Employee",
+        });
+      }
+      // The employee ID has nowhere else to persist — the external roster
+      // service has no update API — so this keeps an ID change from
+      // silently reverting. Keyed on the ORIGINAL (pre-edit) name, the
+      // stable id the override table and the next getPeople() both match on.
+      if (employeeId && employeeId !== editing.original.employeeId) {
+        await api.setPersonEmployeeId(editing.original.name, employeeId);
+      }
+
+      // Any newly added photos in this edit still need uploading.
+      for (const photo of editing.photos) {
+        if (!photo.url || String(photo.id).startsWith("local-")) continue;
+        if (editing.original.photos?.some((p) => p.id === photo.id)) continue;
+        try {
+          const blob = await fetch(photo.url).then((r) => r.blob());
+          await api.enrollFacePhoto(employeeId, blob);
+        } catch (e) {
+          showToast(`A photo could not be saved: ${e.message}`);
+        }
+      }
+
+      await refreshEmployees();
+      showToast("Details updated");
+      closeEdit();
+    } catch (e) {
+      setSaveError(e.message || "Could not save changes — nothing was stored.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   function validateGuest(row) {
@@ -551,18 +668,33 @@ export default function People() {
             </div>
 
             {form.type === "Employee" ? (
-              <div>
-                <label className="text-sm font-medium text-ink-900 block mb-1.5">Department</label>
-                <select
-                  value={form.department}
-                  onChange={(e) => setForm((f) => ({ ...f, department: e.target.value }))}
-                  className="input-field"
-                >
-                  {departments.map((d) => (
-                    <option key={d}>{d}</option>
-                  ))}
-                </select>
-              </div>
+              <>
+                <div>
+                  {/* Typed, not generated: this ID is the key the saved
+                      record, the enrolled face embeddings and live
+                      recognition all share, so it has to be the person's
+                      real ID rather than a random placeholder. */}
+                  <label className="text-sm font-medium text-ink-900 block mb-1.5">Employee ID</label>
+                  <input
+                    value={form.employeeId}
+                    onChange={(e) => setForm((f) => ({ ...f, employeeId: e.target.value }))}
+                    placeholder="e.g. 044"
+                    className="input-field"
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-medium text-ink-900 block mb-1.5">Department</label>
+                  <select
+                    value={form.department}
+                    onChange={(e) => setForm((f) => ({ ...f, department: e.target.value }))}
+                    className="input-field"
+                  >
+                    {departments.map((d) => (
+                      <option key={d}>{d}</option>
+                    ))}
+                  </select>
+                </div>
+              </>
             ) : (
               <>
                 <div>
@@ -612,12 +744,15 @@ export default function People() {
         {step === 2 && (
           <div className="space-y-5">
             <FaceEnrollment photos={form.photos} onAddPhoto={addFormPhoto} onRemovePhoto={removeFormPhoto} />
+            {/* The backend's own message, shown verbatim — the wizard stays
+                open with the entered details so nothing is silently lost. */}
+            {saveError && <p className="text-sm text-danger-600">{saveError}</p>}
             <div className="flex items-center gap-3">
-              <button type="button" onClick={() => setStep(1)} className="btn-secondary flex-1">
+              <button type="button" onClick={() => setStep(1)} disabled={saving} className="btn-secondary flex-1">
                 Back
               </button>
-              <button type="button" onClick={finishEnrollment} className="btn-primary flex-1">
-                {form.photos.length > 0 ? "Finish" : "Skip for now"}
+              <button type="button" onClick={finishEnrollment} disabled={saving} className="btn-primary flex-1">
+                {saving ? "Saving…" : form.photos.length > 0 ? "Finish" : "Skip for now"}
               </button>
             </div>
           </div>
@@ -752,12 +887,13 @@ export default function People() {
         {editing && editStep === 2 && (
           <div className="space-y-5">
             <FaceEnrollment photos={editing.photos} onAddPhoto={addEditPhoto} onRemovePhoto={removeEditPhoto} />
+            {saveError && <p className="text-sm text-danger-600">{saveError}</p>}
             <div className="flex items-center gap-3">
-              <button type="button" onClick={() => setEditStep(1)} className="btn-secondary flex-1">
+              <button type="button" onClick={() => setEditStep(1)} disabled={saving} className="btn-secondary flex-1">
                 Back
               </button>
-              <button type="button" onClick={saveEdit} className="btn-primary flex-1">
-                Save changes
+              <button type="button" onClick={saveEdit} disabled={saving} className="btn-primary flex-1">
+                {saving ? "Saving…" : "Save changes"}
               </button>
             </div>
           </div>
