@@ -93,15 +93,22 @@ export async function signup(payload) {
 
 // ---- Dashboard ---------------------------------------------------------
 export async function getDashboardStats() {
-  // Only the camera count is real; the rest (people/footfall/alerts/AI
+  // Camera count and footfall are real; the rest (people/alerts/AI
   // insights) has no backend pipeline yet, so it stays mock.
-  const cameras = await getCameras();
+  const [cameras, footfall] = await Promise.all([getCameras(), getFootfallSummary().catch(() => null)]);
   const online = cameras.filter((c) => c.status === "Active").length;
+  const gates = footfall?.gates.length ?? 0;
   return {
     ...mock.dashboardStats,
     admin: {
       ...mock.dashboardStats.admin,
       camerasOnline: { value: `${online} / ${cameras.length}`, sub: "" },
+      footfallToday: footfall
+        ? {
+            value: footfall.unique_today,
+            sub: gates ? `across ${gates} gate${gates === 1 ? "" : "s"} · avg ${footfall.avg_per_gate}/gate` : "no gate cameras set",
+          }
+        : { value: "—", sub: "footfall unavailable" },
     },
   };
 }
@@ -287,13 +294,11 @@ export async function getDeskAnalytics() {
 }
 
 // ---- Footfall ------------------------------------------------------------
-export async function getFootfallStats() {
-  // return request("/footfall/stats");
-  return Promise.resolve(mock.footfallStats);
-}
-export async function getFootfallVisitors() {
-  // return request("/footfall/visitors");
-  return Promise.resolve(mock.footfallVisitors);
+// Unique people across every entry gate — each person counted once no
+// matter which gate(s) they used (backend/app/footfall.py). Gate cameras
+// are the ones with purpose "Entry/Exit" in Camera Management.
+export async function getFootfallSummary() {
+  return request("/footfall/summary");
 }
 
 // ---- Intrusion -----------------------------------------------------------

@@ -29,7 +29,7 @@ export default function Dashboard() {
 
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
         <StatCard label="People Present" value={`${s.peoplePresent.value} of ${s.peoplePresent.of}`} sub={s.peoplePresent.sub} />
-        <StatCard label="Footfall Today" value={s.footfallToday.value} sub={s.footfallToday.sub} />
+        <StatCard label="Footfall Today" value={s.footfallToday.value} sub={s.footfallToday.sub} subTone="neutral" />
         <StatCard label="Unknown Visitors" value={s.unknownVisitors.value} sub={s.unknownVisitors.sub} />
         <StatCard label="Cameras" value={s.camerasOnline.value} sub={s.camerasOnline.sub} subTone="danger" />
         <StatCard label="Guests Incoming" value={s.guestsIncoming.value} sub="" />

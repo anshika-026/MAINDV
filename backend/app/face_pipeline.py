@@ -310,6 +310,14 @@ IDENTITY_GRACE_SECONDS = float(os.environ.get("IDENTITY_GRACE_SECONDS", "8"))
 # shown, which is what caused the old face-track overlay to flicker.
 RECOGNITION_STABILITY_FRAMES = int(os.environ.get("RECOGNITION_STABILITY_FRAMES", "2"))
 
+# A single classifier read at or above this confidence commits the identity
+# immediately, skipping the RECOGNITION_STABILITY_FRAMES vote — so a clearly
+# visible face is named on the first frame it's seen. Measured on held-out
+# validation data: reads >= 0.9 are wrong ~0.3% of the time, about the same
+# as the two-vote path. Reads between CLASSIFIER_MIN_PROBA and this still
+# need the vote.
+INSTANT_COMMIT_PROBA = float(os.environ.get("INSTANT_COMMIT_PROBA", "0.9"))
+
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 os.makedirs(TRAINING_UNLABELED_DIR, exist_ok=True)
 
@@ -420,8 +428,14 @@ class CameraFacePipeline:
                 # False, and only plain `onnxruntime` is installed, not
                 # `onnxruntime-gpu`) — CPUExecutionProvider only. Swap back
                 # to the CUDA+CPU list if this ever runs on a GPU box.
+                # Only detection (5-point landmarks for alignment) and
+                # recognition (the embedding) — buffalo_l otherwise also
+                # runs genderage + two dense-landmark models on every face,
+                # none of which anything here reads. Measured: identical
+                # embeddings (cosine >= 0.99999), ~2.6x faster per face.
                 cls._arcface = insightface.app.FaceAnalysis(
-                    name="buffalo_l", providers=["CPUExecutionProvider"]
+                    name="buffalo_l", providers=["CPUExecutionProvider"],
+                    allowed_modules=["detection", "recognition"],
                 )
                 cls._arcface.prepare(ctx_id=-1, det_size=(640, 640))
 
@@ -809,7 +823,10 @@ class CameraFacePipeline:
         clf = self._get_classifier()
         if clf is None:
             return
-        if self.frame_idx - pstate.last_classify_frame < LIVE_CLASSIFY_INTERVAL_FRAMES:
+        # The throttle only applies once a person is already named — an
+        # unnamed person is classified on every opportunity, so nobody waits
+        # an extra cycle just because someone else was classified first.
+        if pstate.current_identity is not None and self.frame_idx - pstate.last_classify_frame < LIVE_CLASSIFY_INTERVAL_FRAMES:
             return
         pstate.last_classify_frame = self.frame_idx
 
@@ -850,7 +867,7 @@ class CameraFacePipeline:
             pstate.pending_identity = predicted
             pstate.pending_count = 1
 
-        if pstate.pending_count >= RECOGNITION_STABILITY_FRAMES:
+        if pstate.pending_count >= RECOGNITION_STABILITY_FRAMES or score >= INSTANT_COMMIT_PROBA:
             pstate.current_identity = predicted
             pstate.identity_confidence = score
             pstate.last_recognized_time = time.time()

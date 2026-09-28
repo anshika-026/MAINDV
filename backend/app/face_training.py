@@ -228,7 +228,12 @@ def _build_split(usable: list[dict]) -> tuple[list[dict], list[dict], dict]:
 def _fit(rows: list[dict]) -> LogisticRegression:
     X = np.array([r["embedding"] for r in rows], dtype=np.float32)
     y = np.array([r["person_id"] for r in rows])
-    clf = LogisticRegression(max_iter=2000)
+    # C=10 + balanced class weights, chosen by comparing variants on the same
+    # grouped held-out split: the default C=1 was under-confident (only 84%
+    # of held-out faces cleared CLASSIFIER_MIN_PROBA on a single read vs 94%
+    # here, same ~0.5% error) and under-served employees with few samples
+    # (per-employee balanced accuracy 0.85 -> 0.95).
+    clf = LogisticRegression(max_iter=3000, C=10, class_weight="balanced")
     # See TRAINING_MAX_THREADS above — caps OpenBLAS/OpenMP to a few
     # threads for just this fit call, leaving most cores free for the live
     # camera pipeline running in this same process. Restored automatically

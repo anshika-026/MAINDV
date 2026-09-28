@@ -103,18 +103,6 @@ export const deskAnalytics = [
   { person: "Aarti Prajapati", firstSeen: "28 Aug, 09:52 AM", lastSeen: "28 Aug, 09:52 AM", deskTime: "2h 32m", awayTime: "12m", currentDesk: "Desk 2", status: "At Desk", movements: 0 },
 ];
 
-export const footfallStats = {
-  peopleCounted: 21,
-  busiestHour: "11:00 AM",
-  unknownVisitors: 12,
-  currentOccupancy: 18,
-};
-
-export const footfallVisitors = [
-  { person: "Unknown person", firstSeen: "28 Aug, 09:52 AM", lastSeen: "28 Aug, 09:52 AM", camera: "Entry / Exit", enrollment: "Unknown" },
-  { person: "Aarti Prajapati", firstSeen: "28 Aug, 09:52 AM", lastSeen: "28 Aug, 09:52 AM", camera: "Entry / Exit", enrollment: "Enrolled" },
-];
-
 export const intrusionZones = [
   { zone: "Reception Area", access: 24, action: "Give Access" },
   { zone: "Canteen Area", access: 60, action: "Give Access" },

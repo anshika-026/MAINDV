@@ -1,68 +1,91 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { AreaChart, Area, ResponsiveContainer, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
-import { UserPlus } from "lucide-react";
+import { DoorOpen } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
-import StatusBadge from "../components/StatusBadge";
 import * as api from "../api/client";
-import { composition, compositionStats, footfallVisitorsExtra, hourlyTraffic } from "../data/footfallExtra";
 
-const TONE_COLOR = {
-  brand: "var(--color-brand-500)",
-  success: "var(--color-success-500)",
-  danger: "var(--color-danger-500)",
-};
+// Real unique footfall across every entry gate (backend/app/footfall.py):
+// all gates share one identity gallery, so a person who enters at one gate
+// and leaves or re-enters through another is still counted once.
 
-const FILTERS = ["All", "Unknown visitors", "Check enrollment"];
-const ENROLLMENT_OPTIONS = ["All", "Enrolled", "Not enrolled", "Unknown"];
+const REFRESH_MS = 30_000;
+
+function hourLabel(h) {
+  if (h === null || h === undefined) return "—";
+  const suffix = h < 12 ? "am" : "pm";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}${suffix}`;
+}
+
+function timeLabel(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
 
 export default function Footfall() {
-  const [stats, setStats] = useState(null);
-  const [visitors, setVisitors] = useState([]);
-  const [filter, setFilter] = useState("All");
-  const [enrollmentPick, setEnrollmentPick] = useState("All");
-  const [enrollmentMenuOpen, setEnrollmentMenuOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
   const [showYesterday, setShowYesterday] = useState(true);
-  const [addedGuests, setAddedGuests] = useState([]);
 
   useEffect(() => {
-    api.getFootfallStats().then(setStats);
-    api.getFootfallVisitors().then((rows) => setVisitors([...rows, ...footfallVisitorsExtra]));
+    let cancelled = false;
+    const load = () =>
+      api
+        .getFootfallSummary()
+        .then((d) => {
+          if (!cancelled) {
+            setData(d);
+            setError("");
+          }
+        })
+        .catch(() => !cancelled && setError("Couldn't load footfall — is the backend running?"));
+    load();
+    const id = setInterval(load, REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
-  const rows = useMemo(() => {
-    let list = visitors;
-    if (filter === "Unknown visitors") list = list.filter((v) => v.enrollment === "Unknown");
-    if (filter === "Check enrollment" && enrollmentPick !== "All") {
-      list = list.filter((v) => v.enrollment === enrollmentPick);
-    }
-    return list;
-  }, [visitors, filter, enrollmentPick]);
+  if (error && !data) return <p className="text-sm text-danger-500">{error}</p>;
+  if (!data) return <p className="text-sm text-slate-400">Loading footfall…</p>;
 
-  const totalComposition = composition.reduce((sum, c) => sum + c.value, 0);
-
-  function quickAdd(row) {
-    setAddedGuests((prev) => [...prev, row.person]);
-  }
+  const hourly = data.hourly.map((r) => ({ ...r, hour: hourLabel(r.hour) }));
+  const maxGate = Math.max(1, ...data.gates.map((g) => g.unique_today));
 
   return (
     <div className="space-y-5">
       <PageHeader title="Footfall" />
 
-      {stats && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard label="People Counted" value={stats.peopleCounted} sub="18 in / 3 out" subTone="neutral" />
-          <StatCard label="Busiest Hour" value={stats.busiestHour} sub="by first-seen visits" subTone="neutral" />
-          <StatCard label="Unknown Visitors" value={stats.unknownVisitors} sub="faces not recognized" subTone="danger" />
-          <StatCard label="Current Occupancy" value={stats.currentOccupancy} sub="currently detected inside" subTone="neutral" />
-        </div>
+      {!data.model_ready && (
+        <p className="card px-4 py-3 text-sm text-danger-500">
+          The Re-ID model isn't installed, so counts will run high. Run{" "}
+          <code>python -m scripts.fetch_reid_model</code> in <code>backend/</code> and restart the backend.
+        </p>
       )}
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <StatCard
+          label="Unique Footfall Today"
+          value={data.unique_today}
+          sub={`each person once, across ${data.gates.length} gate${data.gates.length === 1 ? "" : "s"}`}
+          subTone="neutral"
+        />
+        <StatCard label="Average per Gate" value={data.avg_per_gate} sub="unique people seen at each gate" subTone="neutral" />
+        <StatCard label="Busiest Hour" value={hourLabel(data.busiest_hour)} sub="by first arrival" subTone="neutral" />
+        <StatCard
+          label="Returning Today"
+          value={data.returning_today}
+          sub={`${data.new_today} first-time visitors`}
+          subTone="neutral"
+        />
+      </div>
 
       <div className="grid lg:grid-cols-2 gap-5">
         <div className="card p-5">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold text-ink-900">Peak traffic time</h3>
+            <h3 className="font-semibold text-ink-900">Arrivals by hour</h3>
             <label className="flex items-center gap-2 text-xs text-slate-500 cursor-pointer select-none">
               <span
                 onClick={() => setShowYesterday((v) => !v)}
@@ -81,7 +104,7 @@ export default function Footfall() {
           </div>
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={hourlyTraffic}>
+              <AreaChart data={hourly}>
                 <defs>
                   <linearGradient id="todayFill" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="var(--color-brand-500)" stopOpacity={0.25} />
@@ -90,7 +113,7 @@ export default function Footfall() {
                 </defs>
                 <CartesianGrid vertical={false} stroke="#eceef4" />
                 <XAxis dataKey="hour" tick={{ fontSize: 12, fill: "#94a3b8" }} axisLine={false} tickLine={false} />
-                <YAxis hide />
+                <YAxis hide allowDecimals={false} />
                 <Tooltip />
                 <Area
                   type="monotone"
@@ -117,110 +140,46 @@ export default function Footfall() {
         </div>
 
         <div className="card p-5">
-          <h3 className="font-semibold text-ink-900 mb-4">People Composition</h3>
-          <div className="flex items-center gap-6">
-            <div className="flex-1 space-y-3">
-              <div className="flex h-3 w-full rounded-full overflow-hidden">
-                {composition.map((c, i) => (
-                  <div
-                    key={c.label}
-                    style={{
-                      width: `${(c.value / totalComposition) * 100}%`,
-                      background: TONE_COLOR[c.tone],
-                      marginLeft: i === 0 ? 0 : 2,
-                    }}
-                  />
-                ))}
-              </div>
-              <div className="space-y-2">
-                {composition.map((c) => (
-                  <div key={c.label} className="flex items-center gap-2 text-sm">
-                    <span className="w-2.5 h-2.5 rounded-full" style={{ background: TONE_COLOR[c.tone] }} />
-                    <span className="text-slate-500 flex-1">{c.label}</span>
-                    <span className="font-semibold text-ink-900">{c.value}%</span>
+          <h3 className="font-semibold text-ink-900 mb-1">By gate</h3>
+          <p className="text-xs text-slate-400 mb-4">
+            A person seen at two gates shows under both, so these add up to more than the unique total.
+          </p>
+          {data.gates.length === 0 ? (
+            <p className="text-sm text-slate-500">
+              No gate cameras yet. Set a camera's purpose to <b>Entry/Exit</b> in Camera Management.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {data.gates.map((g) => (
+                <div key={g.camera_id} className="text-sm">
+                  <div className="flex items-center gap-2 mb-1">
+                    <DoorOpen size={14} className="text-slate-400" />
+                    <span className="text-ink-900 flex-1">{g.name}</span>
+                    {!g.counting && <span className="badge badge-warning">not counting</span>}
+                    <span className="font-semibold text-ink-900 w-10 text-right">{g.unique_today}</span>
                   </div>
-                ))}
-              </div>
+                  <div className="h-2 rounded-full bg-[#f1f2f7] overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-brand-500"
+                      style={{ width: `${(g.unique_today / maxGate) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
             </div>
-            <div className="w-px self-stretch bg-border-100" />
-            <div className="space-y-4 text-sm shrink-0">
-              <div>
-                <p className="text-slate-400 text-xs">Top hour</p>
-                <p className="font-semibold text-ink-900 mt-0.5">{compositionStats.topHour}</p>
-              </div>
-              <div>
-                <p className="text-slate-400 text-xs">Unique visitors</p>
-                <p className="font-semibold text-ink-900 mt-0.5">{compositionStats.uniqueVisitors}</p>
-              </div>
-            </div>
-          </div>
+          )}
         </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-1">
-        {FILTERS.map((f) => (
-          <div key={f} className="relative">
-            <button
-              onClick={() => {
-                setFilter(f);
-                if (f === "Check enrollment") setEnrollmentMenuOpen((o) => !o);
-                else setEnrollmentMenuOpen(false);
-              }}
-              className={`px-3.5 py-1.5 rounded-full text-sm font-medium transition-colors ${
-                filter === f ? "bg-brand-500 text-white" : "bg-white border border-border-200 text-slate-600 hover:bg-[#f5f6fa]"
-              }`}
-            >
-              {f}
-              {f === "Check enrollment" ? " ▾" : ""}
-            </button>
-            {f === "Check enrollment" && enrollmentMenuOpen && (
-              <div className="absolute z-10 top-full mt-1 card p-1.5 min-w-[160px]">
-                {ENROLLMENT_OPTIONS.map((opt) => (
-                  <button
-                    key={opt}
-                    onClick={() => {
-                      setEnrollmentPick(opt);
-                      setEnrollmentMenuOpen(false);
-                    }}
-                    className={`w-full text-left px-2.5 py-1.5 rounded-lg text-sm ${
-                      enrollmentPick === opt ? "bg-brand-50 text-brand-600" : "text-slate-600 hover:bg-[#f5f6fa]"
-                    }`}
-                  >
-                    {opt}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
       </div>
 
       <DataTable
         columns={[
           { key: "person", label: "Person" },
-          { key: "firstSeen", label: "First seen" },
-          { key: "lastSeen", label: "Last seen" },
-          { key: "camera", label: "Camera" },
-          { key: "enrollment", label: "Enrollment", render: (r) => <StatusBadge value={r.enrollment} /> },
-          {
-            key: "action",
-            label: "",
-            render: (r) =>
-              r.enrollment === "Unknown" ? (
-                addedGuests.includes(r.person) ? (
-                  <span className="text-xs text-slate-400">Added</span>
-                ) : (
-                  <button
-                    onClick={() => quickAdd(r)}
-                    className="text-brand-600 text-sm font-medium flex items-center gap-1"
-                  >
-                    <UserPlus size={13} /> Add person
-                  </button>
-                )
-              ) : null,
-          },
+          { key: "first_seen", label: "First seen", render: (r) => timeLabel(r.first_seen) },
+          { key: "last_seen", label: "Last seen", render: (r) => timeLabel(r.last_seen) },
+          { key: "gates", label: "Gates", render: (r) => r.gates.join(", ") },
         ]}
-        rows={rows}
+        rows={data.visitors}
+        emptyLabel="Nobody counted yet today"
       />
     </div>
   );

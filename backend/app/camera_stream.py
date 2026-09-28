@@ -10,7 +10,7 @@ import time
 
 import cv2
 
-from . import camera_db, config
+from . import camera_db, config, footfall
 from .face_pipeline import get_pipeline
 
 log = logging.getLogger("camera_stream")
@@ -90,6 +90,11 @@ class CameraStream:
         recognition for the rest of this stream's lifetime rather than
         retrying every frame."""
         try:
+            # Created here, inside the try, rather than in _run(): the
+            # constructor loads the models, and a missing checkpoint must
+            # disable face recognition, not kill the video thread.
+            if self._face_pipeline is None:
+                self._face_pipeline = get_pipeline(self.camera_id)
             self._face_pipeline.feed_frame(frame, has_viewer=has_viewer)
         except Exception:
             log.exception(
@@ -134,11 +139,13 @@ class CameraStream:
                 # broadcast below. Skipped (not queued) if the previous call
                 # is still running.
                 if not self._face_pipeline_failed and (self._pipeline_future is None or self._pipeline_future.done()):
-                    if self._face_pipeline is None:
-                        self._face_pipeline = get_pipeline(self.camera_id)
                     self._pipeline_future = self._pipeline_executor.submit(
                         self._feed_pipeline, frame, self.has_real_viewer()
                     )
+
+                # Unique footfall (gate cameras only — no-op otherwise).
+                # Hands off to its own executor, same reasoning as above.
+                footfall.service.feed(self.camera_id, frame)
 
                 ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:

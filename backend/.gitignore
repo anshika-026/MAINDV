@@ -2,6 +2,10 @@
 # FACE_RECOGNITION_WIRING.md) — never auto-downloaded, never committed.
 models/*.pt
 models/*.onnx
+models/*.pth
+
+# Body crops of real visitors from unique footfall (app/footfall.py) - private, runtime-only.
+data/reid_snapshots/
 
 __pycache__/
 *.pyc

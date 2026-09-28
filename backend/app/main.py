@@ -25,7 +25,7 @@ from pydantic import BaseModel
 import cv2
 
 from . import auth, camera_db, camera_stream, config, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
-from . import face_routes, face_training_routes, license_routes
+from . import face_routes, face_training_routes, footfall, footfall_routes, license_routes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,6 +53,7 @@ app.add_middleware(
 app.include_router(face_routes.router)
 app.include_router(face_training_routes.router)
 app.include_router(license_routes.router)
+app.include_router(footfall_routes.router)
 
 
 @app.on_event("startup")
@@ -73,6 +74,9 @@ def on_startup():
     # the camera pipelines or request handling. See
     # face_training_scheduler.py.
     face_training_scheduler.ensure_scheduler_started()
+    # Unique footfall across entry gates — keeps every "Entry/Exit" camera
+    # streaming and counting, viewer or not. See footfall.py.
+    footfall.service.start()
 
 
 # ---------------------------------------------------------------------------
