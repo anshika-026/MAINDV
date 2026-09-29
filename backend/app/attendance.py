@@ -178,9 +178,10 @@ def day_report(day: str, now: float | None = None) -> dict:
             "company": emp["company"] or "No company",
             "status": status,
             "time_in": _clock(s["first_seen"]) if s else "-",
-            # Still on site -> not left yet, so no time out.
-            "time_out": _clock(s["last_seen"]) if s and status != "On site" else "-",
-            "time_stay": _stay(s["first_seen"], s["last_seen"] if status != "On site" else now) if s else "-",
+            # Time out is always their last sighting so far (it moves forward
+            # while they're still around), and time stay runs first -> last.
+            "time_out": _clock(s["last_seen"]) if s else "-",
+            "time_stay": _stay(s["first_seen"], s["last_seen"]) if s else "-",
             "arrival": ("Late arrival" if s["first_seen"] > late_cutoff else "On time") if s else "-",
             "camera": cameras.get(s["last_camera"], f"Camera {s['last_camera']}") if s else "-",
             "last_seen": _clock(s["last_seen"]) if s else "-",

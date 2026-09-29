@@ -172,28 +172,30 @@ class FootfallService:
         for cid in removed:
             log.info("footfall: camera %s is no longer a gate, stopped counting", cid)
 
-    # --- per-frame hook (called from camera_stream's read loop) -----------
+    # --- tracked people from the shared detector (person_detection.py) -----
 
-    def feed(self, camera_id: int, frame: np.ndarray) -> None:
+    def wants(self, camera_id: int) -> float:
+        """Frames per second footfall wants from this camera (0 = none)."""
         if self._gallery is None or camera_id not in self._sinks or not analytics_settings.enabled("footfall"):
-            return
+            return 0.0
+        runner = self._runners.get(camera_id)
+        if runner is not None and runner.failed:
+            return 0.0
+        return 1.0 / reid_config.REID_MOT_INTERVAL_SECONDS
+
+    def deliver(self, camera_id: int, frame: np.ndarray, people: list[dict], ts: float) -> None:
         runner = self._runners.get(camera_id)
         if runner is None:
             with self._lock:
                 runner = self._runners.setdefault(camera_id, _GateRunner(camera_id, self._gallery, self._generation))
         if runner.failed or (runner.future is not None and not runner.future.done()):
-            return
-        # Cheap pre-check of process_frame's own cadence gate, so frames it
-        # would ignore anyway aren't pushed through the executor.
-        now = time.time()
-        if now - runner.last_submit < reid_config.REID_MOT_INTERVAL_SECONDS:
-            return
-        runner.last_submit = now
-        runner.future = runner.executor.submit(self._process, runner, frame)
+            return  # previous look still being processed: skip this one
+        runner.future = runner.executor.submit(self._process, runner, frame, people, ts)
 
-    def _process(self, runner: _GateRunner, frame: np.ndarray) -> None:
+    def _process(self, runner: _GateRunner, frame: np.ndarray, people: list[dict] | None = None, ts: float | None = None) -> None:
+        """people=None: detect here with the runner's own tracker (tests)."""
         try:
-            result = reid_worker.process_frame(runner.camera_id, frame, runner.state)
+            result = reid_worker.process_frame(runner.camera_id, frame, runner.state, people=people, now=ts)
             if result:
                 self._record(runner.camera_id, result, runner.generation)
         except Exception:
@@ -422,3 +424,7 @@ class FootfallService:
 
 
 service = FootfallService()
+
+from app import person_detection  # noqa: E402
+
+person_detection.service.register("footfall", service.wants, service.deliver)

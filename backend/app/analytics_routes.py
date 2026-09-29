@@ -17,7 +17,10 @@ router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 @router.get("/settings")
 def get_settings(_: dict = Depends(auth.get_principal)):
-    return {"features": analytics_settings.snapshot(), "cpu": analytics_settings.cpu_usage()}
+    from app import person_detection
+
+    return {"features": analytics_settings.snapshot(), "cpu": analytics_settings.cpu_usage(),
+            "person_detectors": person_detection.service.status()}
 
 
 class SwitchIn(BaseModel):

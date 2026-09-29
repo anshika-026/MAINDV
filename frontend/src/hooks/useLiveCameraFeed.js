@@ -1,84 +1,58 @@
 import { useEffect, useRef, useState } from "react";
 import { WS_HOST, WS_PROTOCOL } from "../api/client";
 
-// Placeholder labels that mean "we could not identify this person". None
-// of them are ever rendered — an unrecognized person gets NO overlay at
-// all. Kept as a defensive filter here at the display layer so that a
-// value like "Unknown" arriving from an older recognition component still
-// can't reach the screen.
-const NON_IDENTITY_LABELS = new Set([
-  "unknown",
-  "person",
-  "unidentified",
-  "face",
-  "no match",
-  "no_match",
-]);
+// Person-first overlay: every tracked person the backend sends gets a box
+// (their full body, from face_pipeline.py's person tracks) labelled "Person".
+// The label becomes the employee's name only once face recognition has
+// confidently and stably identified them; the backend keeps sending that name
+// for its identity-hold period (IDENTITY_GRACE_SECONDS) after the face is
+// lost, then the track goes back to no identity and the label to "Person".
+// "Unknown" is never shown: anything that isn't a real name reads "Person".
+const GENERIC_LABEL = "Person";
 
-// The overlay is identity-only by design. Person detection and tracking
-// keep running in the backend and the detection payload still carries
-// bboxes and colours (other functionality depends on both — see
-// face_pipeline.py's _update_person_overlay), but the generic person
-// rectangle is never drawn: nothing appears on screen unless face
-// recognition produced a confident identity. Returns the name to
-// display, or null when there is nothing to show.
-function recognizedNameOf(det) {
-  if (!det || !det.employee_id) return null;
+// Labels that mean "not identified". An older recognition component could
+// send one of these as a name; they're shown as "Person", never as text.
+const NON_IDENTITY_LABELS = new Set(["unknown", "person", "unidentified", "face", "no match", "no_match"]);
+
+function labelOf(det) {
+  if (!det || !det.employee_id) return GENERIC_LABEL;
   const name = typeof det.name === "string" ? det.name.trim() : "";
-  if (!name) return null;
-  if (NON_IDENTITY_LABELS.has(name.toLowerCase())) return null;
+  if (!name || NON_IDENTITY_LABELS.has(name.toLowerCase())) return GENERIC_LABEL;
   return name;
 }
 
-// Only ever used if a detection somehow arrives without a colour — the
-// same neutral this file has always used for that case. The real colours
-// come from the employee -> company -> colour pipeline in
-// employee_directory.py (resolved server-side, sent as det.color); this
-// file never picks, overrides or maps a colour itself.
-const FALLBACK_LABEL_COLOR = "#6b7280";
+// One style for everyone, "Person" and named people alike. Identity never
+// changes the colour (no per-company or per-employee colours).
+const OVERLAY_COLOR = "#2563eb";
 
-// Draws ONLY a recognized person's name, positioned from the backend's bbox
-// (in the camera's full-resolution pixels; the caller scales the canvas when
-// the picture is smaller, e.g. 960 px grid tiles).
-//
-// The generic person rectangle is deliberately NOT drawn — the bbox is
-// used purely to position the name over that person. The name keeps the
-// existing colour-coded label styling (company colour behind white text),
-// which is what makes every company colour legible over live video,
-// including Shaurrya's #000000.
-//
-// `k` undoes the canvas scale for text sizes, so the label stays the same
-// readable size whatever the picture's resolution.
+// Draws one person's box and label, in the camera's full-resolution pixels
+// (the caller scales the canvas when the picture is smaller, e.g. 960 px grid
+// tiles). `k` undoes that scale for line and text sizes, so the box and label
+// look the same whatever the picture's resolution.
 function drawDetection(ctx, det, k = 1) {
-  const name = recognizedNameOf(det);
-  if (!name) return; // unrecognized -> intentionally nothing rendered
+  const [x1, y1, x2, y2] = det.bbox;
+  const label = labelOf(det);
 
-  // That person's existing company colour, exactly as assigned server-side.
-  const color = det.color || FALLBACK_LABEL_COLOR;
+  ctx.lineWidth = 2 * k;
+  ctx.strokeStyle = OVERLAY_COLOR;
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
-  const [x1, y1, x2] = det.bbox;
   ctx.font = `600 ${13 * k}px sans-serif`;
-  const padding = 4 * k;
-  const labelHeight = 18 * k;
-  const labelWidth = ctx.measureText(name).width + padding * 2;
-  // Centred over the person rather than pinned to the (now invisible)
-  // box's left edge, so the name still reads as belonging to them.
-  const labelX = (x1 + x2) / 2 - labelWidth / 2;
+  const padding = 5 * k;
+  const labelHeight = 20 * k;
+  const labelWidth = ctx.measureText(label).width + padding * 2;
   const labelY = y1 - labelHeight >= 0 ? y1 - labelHeight : y1;
-
-  ctx.fillStyle = color;
-  ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
+  ctx.fillStyle = OVERLAY_COLOR;
+  ctx.fillRect(x1, labelY, labelWidth, labelHeight);
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(name, labelX + padding, labelY + labelHeight - 5 * k);
+  ctx.fillText(label, x1 + padding, labelY + labelHeight - 6 * k);
 }
 
 // Opens the backend's per-camera live-view websocket (camera_stream.py) and
 // paints each incoming JPEG frame onto a canvas, plus a second websocket
-// (main.py's /ws/detections) for the live IDENTITY overlay. The backend
-// still detects and tracks every person and still sends their bbox; this
-// overlay deliberately renders only the names of people face recognition
-// has confidently and stably identified, and renders nothing at all for
-// anyone it hasn't (see drawDetection). Shared by the grid tile and the
+// (main.py's /ws/detections) for the live person overlay: a box per tracked
+// person, labelled "Person" or, once confidently recognised, their name (see
+// drawDetection). Shared by the grid tile and the
 // enlarged viewer modal so both draw from their own independent
 // connections using identical wiring.
 // Pass { overlay: false } for plain video: no detections websocket, and the

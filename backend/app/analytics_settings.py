@@ -13,6 +13,10 @@ survives a restart.
   footfall          unique footfall Re-ID on gate cameras (footfall.py).
   intrusion         person detection in restricted zones (intrusion.py).
   staff_count       entry/exit line counting at entrance cameras (staff/).
+  alerts            raising new alerts (alerts.py); existing ones stay listed.
+  expression        facial-expression reading on live faces (expression.py).
+  appearance_handoff naming faceless people on the live overlay by body
+                    appearance learned from today's face matches (appearance.py).
   live_overlay      the person boxes drawn on the AI Analytics view: an extra
                     person-detection pass per watched camera (face_pipeline.py).
 
@@ -36,8 +40,12 @@ FEATURES = {
     "live_overlay": "Live person boxes",
     "intrusion": "Intrusion detection",
     "staff_count": "Staff count",
+    "alerts": "Alerts",
+    "expression": "Expression detection",
+    "appearance_handoff": "Name by appearance",
 }
-DEPENDS_ON = {"desk_analytics": "face_recognition"}
+# Expression reads the face crops of the live person boxes, so it needs them on.
+DEPENDS_ON = {"desk_analytics": "face_recognition", "expression": "live_overlay", "appearance_handoff": "face_recognition"}
 
 _state = {k: True for k in FEATURES}
 _lock = threading.Lock()

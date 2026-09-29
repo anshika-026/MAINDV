@@ -1,4 +1,4 @@
-"""Intrusion zones (app/intrusion.py) with a fake person detector."""
+"""Intrusion zones (app/intrusion.py), fed person boxes as the shared detector would."""
 
 import datetime
 
@@ -6,23 +6,6 @@ import numpy as np
 import pytest
 
 from app import alerts, analytics_settings, camera_db, intrusion
-
-
-class FakeBoxes:
-    def __init__(self, xyxy):
-        self.xyxy = type("T", (), {"cpu": lambda s: type("N", (), {"numpy": lambda s2: np.array(xyxy, dtype=float)})()})()
-        self._n = len(xyxy)
-
-    def __len__(self):
-        return self._n
-
-
-class FakeModel:
-    def __init__(self, boxes):
-        self.boxes = boxes
-
-    def predict(self, *a, **k):
-        return [type("R", (), {"boxes": FakeBoxes(self.boxes)})()]
 
 
 @pytest.fixture(autouse=True)
@@ -58,9 +41,9 @@ def test_person_whose_feet_are_in_the_zone_raises_one_alert():
     zone = intrusion.create_zone(5, "Store room", RIGHT, None, None)
     svc = intrusion.service
     # Person standing in the zone (feet at x=0.7), and one outside it (feet at x=0.2).
-    svc._models[5] = FakeModel([[650, 100, 750, 450], [150, 100, 250, 450]])
-    svc._detect(5, FRAME, [zone], at(22, 0))
-    svc._detect(5, FRAME, [zone], at(22, 0) + 5)  # still there: same alert, counted again
+    boxes = [[650, 100, 750, 450], [150, 100, 250, 450]]
+    svc._detect(5, FRAME, [zone], at(22, 0), boxes)
+    svc._detect(5, FRAME, [zone], at(22, 0) + 5, boxes)  # still there: same alert, counted again
     rows = alerts.list_alerts("all")
     assert [(r["event"], r["occurrences"], r["has_snapshot"]) for r in rows] == [("Intrusion Detected", 2, True)]
     assert "1 person inside Store room" in rows[0]["message"]
@@ -69,6 +52,5 @@ def test_person_whose_feet_are_in_the_zone_raises_one_alert():
 def test_body_overlapping_zone_but_feet_outside_is_ignored():
     zone = intrusion.create_zone(5, "Store room", RIGHT, None, None)
     # Box straddles the edge; feet (bottom centre x=0.45) are outside the zone.
-    intrusion.service._models[5] = FakeModel([[350, 100, 550, 450]])
-    intrusion.service._detect(5, FRAME, [zone], at(22, 0))
+    intrusion.service._detect(5, FRAME, [zone], at(22, 0), [[350, 100, 550, 450]])
     assert alerts.list_alerts("all") == []

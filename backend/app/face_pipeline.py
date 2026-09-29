@@ -52,6 +52,8 @@ from ultralytics import YOLO
 import insightface
 
 from app import alerts
+from app import analytics_settings
+from app import appearance
 from app import attendance
 from app import desks
 from app import face_db
@@ -366,6 +368,15 @@ RECOGNITION_STABILITY_FRAMES = int(os.environ.get("RECOGNITION_STABILITY_FRAMES"
 # need the vote.
 INSTANT_COMMIT_PROBA = float(os.environ.get("INSTANT_COMMIT_PROBA", "0.9"))
 
+# Identity hand-off by body appearance (appearance.py): a person with no
+# face identity is compared, at most every APPEARANCE_INTERVAL_SECONDS and for
+# at most APPEARANCE_MATCHES_PER_CYCLE people per update, against people face-
+# recognised today; APPEARANCE_STABILITY agreeing matches in a row are needed
+# before the name is shown.
+APPEARANCE_INTERVAL_SECONDS = float(os.environ.get("APPEARANCE_INTERVAL_SECONDS", "2.0"))
+APPEARANCE_MATCHES_PER_CYCLE = 2
+APPEARANCE_STABILITY = 2
+
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 os.makedirs(TRAINING_UNLABELED_DIR, exist_ok=True)
 
@@ -410,6 +421,14 @@ class PersonTrackState:
     # identity decision above, so a missing or failed mood can't change
     # who this person is (see expression.py).
     last_expression_frame: int = -999_999
+    # Identity from body appearance (appearance.py), used only while there's
+    # no face identity to show. Same hold as a face identity.
+    appearance_identity: str | None = None
+    appearance_confidence: float = 0.0
+    appearance_time: float = 0.0
+    appearance_pending: str | None = None
+    appearance_pending_count: int = 0
+    appearance_last_try: float = 0.0
 
 
 class CameraFacePipeline:
@@ -842,6 +861,8 @@ class CameraFacePipeline:
             if face_row is not None:
                 self._update_person_identity(pstate, frame, face_row)
 
+        self._update_appearance_identities(frame, track_ids_this_frame)
+
         now = time.time()
         live_this_frame = []
         stale_persons = []
@@ -854,8 +875,14 @@ class CameraFacePipeline:
             # baked into current_identity itself — so it decays smoothly
             # rather than needing its own timer/callback.
             display_identity = None
+            identity_source = None
+            confidence = 0.0
             if pstate.current_identity and (now - pstate.last_recognized_time) <= IDENTITY_GRACE_SECONDS:
-                display_identity = pstate.current_identity
+                display_identity, identity_source, confidence = pstate.current_identity, "face", pstate.identity_confidence
+            elif pstate.appearance_identity and (now - pstate.appearance_time) <= IDENTITY_GRACE_SECONDS:
+                # No face identity (face not visible): named by body appearance
+                # matched against someone face-recognised today (appearance.py).
+                display_identity, identity_source, confidence = pstate.appearance_identity, "appearance", pstate.appearance_confidence
 
             # name/color resolved from employee_directory.py, keyed by
             # employee_id only — never changes tracking/identity logic
@@ -875,7 +902,8 @@ class CameraFacePipeline:
                 "employee_id": display_identity,  # None -> frontend shows "Person", never "Unknown"
                 "name": name,
                 "color": color,
-                "confidence": pstate.identity_confidence if display_identity else 0.0,
+                "confidence": confidence,
+                "identity_source": identity_source,  # face | appearance | None
                 "expression": expr,
                 "expression_confidence": expr_conf,
             })
@@ -921,7 +949,7 @@ class CameraFacePipeline:
         # detection pass anywhere. submit() is fire-and-forget and drops
         # the crop if its worker is busy, so this line cannot slow down
         # recognition below it (see expression.py).
-        if self.frame_idx - pstate.last_expression_frame >= EXPRESSION_INTERVAL_FRAMES:
+        if analytics_settings.enabled("expression") and self.frame_idx - pstate.last_expression_frame >= EXPRESSION_INTERVAL_FRAMES:
             pstate.last_expression_frame = self.frame_idx
             expression.service.submit(self.camera_id, pstate.track_id, crop)
 
@@ -952,6 +980,7 @@ class CameraFacePipeline:
             # and confidence, no need to re-run the stability vote.
             pstate.last_recognized_time = time.time()
             pstate.identity_confidence = score
+            self._learn_appearance(predicted, frame, pstate)
             return
 
         if predicted == pstate.pending_identity:
@@ -964,6 +993,55 @@ class CameraFacePipeline:
             pstate.current_identity = predicted
             pstate.identity_confidence = score
             pstate.last_recognized_time = time.time()
+            self._learn_appearance(predicted, frame, pstate)
+
+    def _learn_appearance(self, employee_id: str, frame: np.ndarray, pstate: PersonTrackState) -> None:
+        """A face just confirmed who this is: remember their body appearance
+        for today so faceless sightings elsewhere can be named (appearance.py)."""
+        if not analytics_settings.enabled("appearance_handoff"):
+            return
+        try:
+            appearance.gallery.learn(employee_id, frame, pstate.bbox)
+        except Exception:
+            log.exception("camera %s: learning appearance failed", self.camera_id)
+
+    def _update_appearance_identities(self, frame: np.ndarray, track_ids: list[int]) -> None:
+        """Name people with no current face identity by body appearance.
+        Face identity always takes precedence (see the display code)."""
+        if not analytics_settings.enabled("appearance_handoff") or not appearance.gallery.known_count():
+            return
+        now = time.time()
+        # Employees already shown by face on this camera can't also be someone else here.
+        taken = {p.current_identity for p in self.person_tracks.values()
+                 if p.current_identity and now - p.last_recognized_time <= IDENTITY_GRACE_SECONDS}
+        tries = 0
+        for tid in track_ids:
+            if tries >= APPEARANCE_MATCHES_PER_CYCLE:
+                break
+            p = self.person_tracks[tid]
+            has_face_identity = p.current_identity and now - p.last_recognized_time <= IDENTITY_GRACE_SECONDS
+            if has_face_identity or now - p.appearance_last_try < APPEARANCE_INTERVAL_SECONDS:
+                continue
+            p.appearance_last_try = now
+            tries += 1
+            try:
+                emp, score = appearance.gallery.match(frame, p.bbox, exclude=taken)
+            except Exception:
+                log.exception("camera %s: appearance match failed", self.camera_id)
+                return
+            if emp is None:
+                p.appearance_pending, p.appearance_pending_count = None, 0
+                continue
+            if emp == p.appearance_identity:
+                p.appearance_time, p.appearance_confidence = now, score
+                continue
+            if emp == p.appearance_pending:
+                p.appearance_pending_count += 1
+            else:
+                p.appearance_pending, p.appearance_pending_count = emp, 1
+            if p.appearance_pending_count >= APPEARANCE_STABILITY:
+                p.appearance_identity, p.appearance_confidence, p.appearance_time = emp, score, now
+                taken.add(emp)
 
     def _identify(self, frame: np.ndarray, bbox) -> tuple[str | None, float]:
         """Employee id + classifier probability for one face box, for

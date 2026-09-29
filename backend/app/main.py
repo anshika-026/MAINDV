@@ -451,6 +451,8 @@ async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None 
                         "name": _employee_display_name(emp_id) if emp_id else None,
                         "color": color,
                         "confidence": det["confidence"],
+                        # face | appearance (named by body, appearance.py) | None
+                        "identity_source": det.get("identity_source"),
                         # Additive fields — every existing consumer of this
                         # payload keeps working unchanged. Both are null/0
                         # when the expression model has nothing confident

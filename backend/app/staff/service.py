@@ -5,7 +5,7 @@ Runs Staff Count on live cameras. camera_stream.py hands every frame to
 feed(); for each camera configured as an entrance (staff_camera_config, set
 on the Staff Count page) about `process_fps` frames a second go through:
 
-  YOLOv8 person detection + ByteTrack/BoT-SORT (ultralytics, persistent ids)
+  YOLOv8 person detection + ByteTrack (shared per camera, person_detection.py)
   -> StaffCameraTracker (office ROI, entry-line crossings, identity votes)
   -> StaffOccupancyManager (one for all cameras; the source of truth)
 
@@ -129,10 +129,8 @@ class _Camera:
     def __init__(self, camera_id: int, manager, cfg: dict, cam_cfg: dict):
         self.camera_id = camera_id
         self.tracker = StaffCameraTracker(camera_id, manager, cam_cfg["line"], cam_cfg["inside_sign"], cam_cfg["roi"], cfg)
-        self.model = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"staff-{camera_id}")
         self.future = None
-        self.last_submit = 0.0
         self.failed = False
         self.last_processed = None
 
@@ -201,32 +199,34 @@ class StaffService:
 
     # ---- per frame ----------------------------------------------------------------
 
-    def feed(self, camera_id: int, frame: np.ndarray) -> None:
+    # Tracked people come from the shared per-camera detector
+    # (person_detection.py), paced at process_fps for entrance cameras.
+    def wants(self, camera_id: int) -> float:
         cam = self._cams.get(camera_id)
-        if cam is None or cam.failed or not analytics_settings.enabled("staff_count"):
-            return
-        now = time.time()
-        if now - cam.last_submit < 1.0 / self.cfg["process_fps"]:
-            return
-        if cam.future is not None and not cam.future.done():
-            return
-        cam.last_submit = now
-        cam.future = cam.executor.submit(self._process, cam, frame, now)
+        if cam is None or cam.failed or not analytics_settings.enabled("staff_count") or camera_id not in self._sinks:
+            return 0.0
+        return float(self.cfg["process_fps"])
 
-    def _process(self, cam: _Camera, frame: np.ndarray, ts: float) -> None:
+    def deliver(self, camera_id: int, frame: np.ndarray, people: list[dict], ts: float) -> None:
+        cam = self._cams.get(camera_id)
+        if cam is None or (cam.future is not None and not cam.future.done()):
+            return  # previous frame still being processed: skip this one
+        cam.future = cam.executor.submit(self._process, cam, frame, ts, people)
+
+    def _process(self, cam: _Camera, frame: np.ndarray, ts: float, people: list[dict]) -> None:
         try:
-            if cam.model is None:
-                from ultralytics import YOLO
-
-                cam.model = YOLO(MODEL_PATH)
-            res = cam.model.track(frame, persist=True, tracker=self.cfg["tracker"], classes=[0],
-                                  conf=self.cfg["detection_confidence"], imgsz=self.cfg["imgsz"], verbose=False)[0]
-            people = []
-            if res.boxes is not None and res.boxes.id is not None:
-                for tid, box in zip(res.boxes.id.cpu().numpy().astype(int), res.boxes.xyxy.cpu().numpy()):
-                    people.append({"track_id": int(tid), "bbox": [float(v) for v in box]})
+            people = [p for p in people if p["track_id"] is not None and p["confidence"] >= self.cfg["detection_confidence"]]
             identify = (lambda b: self.identity.identify(frame, b)) if not self.anonymous_mode() else None
             cam.tracker.update(people, frame.shape, ts, identify, lambda b: self.identity.embed(frame, b))
+            # Faces confirmed at the entrance teach the appearance hand-off
+            # (appearance.py), so these people can be named on desk cameras
+            # that only see their backs. learn() rate-limits per employee.
+            if analytics_settings.enabled("appearance_handoff"):
+                from app import appearance
+
+                for t in cam.tracker.tracks.values():
+                    if t.employee_id and t.last_seen == ts and t.bbox:
+                        appearance.gallery.learn(t.employee_id, frame, t.bbox, ts)
             cam.last_processed = ts
         except Exception:
             log.exception("staff: processing failed on camera %s, disabling Staff Count there", cam.camera_id)
@@ -265,3 +265,7 @@ class StaffService:
 
 
 service = StaffService()
+
+from app import person_detection  # noqa: E402
+
+person_detection.service.register("staff_count", service.wants, service.deliver)

@@ -36,13 +36,13 @@ const NAV_SECTIONS = [
     items: [
       { to: "/live-feed", label: "Live Feed", icon: MonitorPlay },
       { to: "/live-camera", label: "AI Analytics", icon: ScanEye, analytics: "live_overlay" },
-      { to: "/alerts", label: "Alerts & Events", icon: Siren, badgeKey: "alerts" },
+      { to: "/alerts", label: "Alerts & Events", icon: Siren, badgeKey: "alerts", analytics: "alerts" },
     ],
   },
   {
     title: "People",
     items: [
-      { to: "/people", label: "Identity", icon: Fingerprint, requiresFeature: "face_recognition" },
+      { to: "/people", label: "Identity", icon: Fingerprint, requiresFeature: "face_recognition", analytics: "face_recognition" },
       { to: "/attendance", label: "Presence", icon: UserCheck, requiresFeature: "attendance", analytics: "face_recognition" },
       { to: "/staff", label: "Staff Count", icon: Users, requiresFeature: "attendance", analytics: "staff_count" },
     ],
@@ -52,7 +52,7 @@ const NAV_SECTIONS = [
     items: [
       { to: "/workforce", label: "Workforce Insights", icon: TrendingUp, requiresFeature: "workforce_analytics", analytics: "desk_analytics" },
       { to: "/footfall", label: "Footfall", icon: Footprints, requiresFeature: "footfall_analytics", analytics: "footfall" },
-      { to: "/footfall-uat", label: "Footfall UAT", icon: FlaskConical, requiresFeature: "footfall_analytics", adminOnly: true },
+      { to: "/footfall-uat", label: "Footfall UAT", icon: FlaskConical, requiresFeature: "footfall_analytics", adminOnly: true, analytics: "footfall" },
       { to: "/intrusion", label: "Intrusion", icon: ShieldX, requiresFeature: "intrusion_detection", analytics: "intrusion" },
     ],
   },
@@ -65,6 +65,16 @@ const NAV_SECTIONS = [
       { to: "/licenses", label: "Client License", icon: IdCard },
     ],
   },
+];
+
+// Analytics without a page of their own, switched from the CPU panel.
+const EXTRA_SWITCHES = [
+  ["expression", "Expression detection", "Reads facial expressions on the live person boxes (needs AI Analytics on)."],
+  [
+    "appearance_handoff",
+    "Name by appearance",
+    "Names people facing away on the live view by body appearance, matched to someone recognised by face today (needs face recognition on).",
+  ],
 ];
 
 export default function Sidebar() {
@@ -204,6 +214,25 @@ export default function Sidebar() {
             <span>Whole laptop</span>
             <span className={`font-semibold ${cpu.system_pct > 85 ? "text-danger-500" : "text-ink-900"}`}>{Math.round(cpu.system_pct)}%</span>
           </p>
+          {EXTRA_SWITCHES.filter(([key]) => switches?.[key]).map(([key, label, hint]) => (
+            <p key={key} className="flex justify-between items-center pt-1">
+              <span title={hint}>{label}</span>
+              <span
+                role="switch"
+                tabIndex={0}
+                aria-checked={switches[key].on}
+                aria-label={`${label}: ${switches[key].on ? "on" : "off"}`}
+                title={switches[key].on && !switches[key].effective ? `${hint} It's on but paused until what it needs is on.` : hint}
+                onClick={(e) => toggle(e, key)}
+                onKeyDown={(e) => (e.key === " " || e.key === "Enter") && toggle(e, key)}
+                className={`relative inline-block w-8 h-[18px] rounded-full cursor-pointer ${
+                  switches[key].effective ? "bg-success-500" : switches[key].on ? "bg-warning-500" : "bg-slate-300"
+                }`}
+              >
+                <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow transition-all ${switches[key].on ? "left-[16px]" : "left-[2px]"}`} />
+              </span>
+            </p>
+          ))}
           <p className="flex justify-between">
             <span>Free memory</span>
             <span className={`font-semibold ${cpu.memory_free_gb < 1.5 ? "text-danger-500" : "text-ink-900"}`}>

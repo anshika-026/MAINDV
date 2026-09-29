@@ -4,7 +4,8 @@ intrusion.py
 Restricted-area (intrusion) detection. An admin draws a zone (a polygon on
 a camera's picture, fractions of the frame) and optionally an active window
 ("19:00"-"08:00" = overnight only). About once a second, each camera with an
-enabled zone runs a person detector (YOLOv8n); a person whose FEET — the
+enabled zone gets tracked people from the shared per-camera detector
+(person_detection.py); a person whose FEET — the
 bottom-centre of their box — are inside an active zone is an intrusion. The
 feet, not the box centre, so someone walking past in front of the area
 doesn't count as being in it.
@@ -37,7 +38,6 @@ from app.desk_tracker import in_polygon
 log = logging.getLogger("intrusion")
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
-MODEL_PATH = str(Path(__file__).resolve().parent.parent / "models" / "yolov8n.pt")
 CYCLE_SECONDS = 1.0
 PERSON_CONF = 0.45
 EVENT_LOG_SECONDS = 30
@@ -173,10 +173,8 @@ class _KeepAliveSink:
 class IntrusionService:
     def __init__(self):
         self._zones: dict[int, list[dict]] = {}
-        self._models: dict[int, object] = {}
         self._executors: dict[int, concurrent.futures.ThreadPoolExecutor] = {}
         self._futures: dict[int, concurrent.futures.Future] = {}
-        self._last_cycle: dict[int, float] = {}
         self._last_logged: dict[int, float] = {}
         self._sinks: dict[int, _KeepAliveSink] = {}
         self._failed: set[int] = set()
@@ -216,42 +214,30 @@ class IntrusionService:
         for cid in self._sinks.keys() - wanted:
             camera_stream.get_stream(cid).unsubscribe(self._sinks.pop(cid))
 
-    def feed(self, camera_id: int, frame: np.ndarray) -> None:
+    # People come from the shared per-camera detector (person_detection.py),
+    # about once a second on cameras with a zone inside its active hours.
+    def wants(self, camera_id: int) -> float:
         zones = self._zones.get(camera_id)
         if not zones or camera_id in self._failed or not analytics_settings.enabled("intrusion"):
-            return
-        now = time.time()
-        if now - self._last_cycle.get(camera_id, 0) < CYCLE_SECONDS:
-            return
+            return 0.0
+        return 1.0 / CYCLE_SECONDS if any(is_active(z) for z in zones) else 0.0
+
+    def deliver(self, camera_id: int, frame: np.ndarray, people: list[dict], ts: float) -> None:
         fut = self._futures.get(camera_id)
         if fut is not None and not fut.done():
             return
-        active = [z for z in zones if is_active(z, now)]
+        active = [z for z in self._zones.get(camera_id, []) if is_active(z, ts)]
         if not active:
             return
-        self._last_cycle[camera_id] = now
+        boxes = [p["bbox"] for p in people if p["confidence"] >= PERSON_CONF]
         ex = self._executors.setdefault(
             camera_id, concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"intrusion-{camera_id}"))
-        self._futures[camera_id] = ex.submit(self._detect, camera_id, frame, active, now)
+        self._futures[camera_id] = ex.submit(self._detect, camera_id, frame, active, ts, boxes)
 
-    def _model(self, camera_id: int):
-        if camera_id not in self._models:
-            from ultralytics import YOLO
-
-            self._models[camera_id] = YOLO(MODEL_PATH)
-        return self._models[camera_id]
-
-    def _detect(self, camera_id: int, frame: np.ndarray, zones: list[dict], now: float) -> None:
-        try:
-            res = self._model(camera_id).predict(frame, verbose=False, conf=PERSON_CONF, classes=[0], imgsz=640)[0]
-        except Exception:
-            log.exception("intrusion: person detection failed on camera %s, disabling it", camera_id)
-            self._failed.add(camera_id)
-            return
-        if res.boxes is None or not len(res.boxes):
+    def _detect(self, camera_id: int, frame: np.ndarray, zones: list[dict], now: float, boxes: list) -> None:
+        if not boxes:
             return
         h, w = frame.shape[:2]
-        boxes = res.boxes.xyxy.cpu().numpy()
         for zone in zones:
             inside = [b for b in boxes if in_polygon((b[0] + b[2]) / 2 / w, b[3] / h, zone["polygon"])]
             if not inside:
@@ -286,3 +272,7 @@ def _annotate(frame: np.ndarray, zone: dict, boxes) -> bytes | None:
 
 
 service = IntrusionService()
+
+from app import person_detection  # noqa: E402
+
+person_detection.service.register("intrusion", service.wants, service.deliver)

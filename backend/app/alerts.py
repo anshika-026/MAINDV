@@ -82,6 +82,10 @@ def raise_alert(event: str, severity: str, camera_id: int | None = None, message
                 dedupe_key: str | None = None, confidence: float | None = None,
                 employee_id: str | None = None, snapshot_jpeg: bytes | None = None,
                 now: float | None = None) -> int:
+    from app import analytics_settings
+
+    if not analytics_settings.enabled("alerts"):
+        return 0  # Alerts switched off: nothing new is raised (existing alerts stay listed)
     now = now if now is not None else time.time()
     with _lock, _conn() as conn:
         if dedupe_key:

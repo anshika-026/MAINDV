@@ -52,6 +52,8 @@ def test_late_arrival_and_on_site():
     assert r["arrival"] == "Late arrival"
     # "On site" only makes sense for today; day_report's `now` is the 28th here.
     assert r["status"] in ("On site", "Present")
+    # Time out is the last sighting even while they're still on site.
+    assert r["time_out"] == "10:05 AM"
     assert report["stats"]["present"] == 1 and report["stats"]["late"] == 1
 
 

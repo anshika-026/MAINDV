@@ -14,9 +14,9 @@ from multiprocessing import shared_memory
 import cv2
 import numpy as np
 
-from . import analytics_settings, camera_db, config, footfall, intrusion, rtsp_reader
+from . import analytics_settings, camera_db, config, footfall, intrusion, person_detection, rtsp_reader  # noqa: F401 (footfall/intrusion register as consumers on import)
 from .face_pipeline import get_pipeline
-from .staff.service import service as staff_service
+from .staff import service as _staff_service  # noqa: F401 (registers with person_detection on import)
 
 log = logging.getLogger("camera_stream")
 
@@ -227,13 +227,12 @@ class CameraStream:
                         self._feed_pipeline, frame, self.has_real_viewer() and analytics_settings.enabled("live_overlay")
                     )
 
-                # Unique footfall (gate cameras only — no-op otherwise).
-                # Hands off to its own executor, same reasoning as above.
-                footfall.service.feed(self.camera_id, frame)
-                # Restricted-zone intrusion (cameras with zones only).
-                intrusion.service.feed(self.camera_id, frame)
-                # Staff Count: entry-line crossings at entrance cameras only.
-                staff_service.feed(self.camera_id, frame)
+                # Footfall, Staff Count and intrusion share ONE person detector
+                # per camera (person_detection.py), run at the rate the most
+                # demanding of them needs and only while one of them wants
+                # this camera. Hands off to its own executor, same reasoning
+                # as above.
+                person_detection.service.feed(self.camera_id, frame)
 
                 # JPEG-encode once per distinct width actually being watched.
                 # Full-HD JPEGs at 8 fps are ~17 Mbps per camera to each

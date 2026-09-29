@@ -57,7 +57,7 @@ export default function StaffDebugView({ cameraId }) {
         ctx.strokeStyle = color;
         ctx.lineWidth = 2;
         ctx.strokeRect(bx1, by1, bx2 - bx1, by2 - by1);
-        const who = t.name ? `${t.name} ${Math.round((t.confidence || 0) * 100)}%` : "unknown";
+        const who = t.name ? `${t.name} ${Math.round((t.confidence || 0) * 100)}%` : "Person";
         const label = `#${t.track_id} ${who} · ${t.side === "in" ? "INSIDE" : t.side === "out" ? "OUTSIDE" : "on line"}`;
         const tw = ctx.measureText(label).width;
         ctx.fillStyle = color;
@@ -72,7 +72,7 @@ export default function StaffDebugView({ cameraId }) {
         }
       }
       const c = d.count || {};
-      const banner = `Staff inside: ${c.current_staff_count ?? "-"}   Known ${c.known_staff ?? "-"} · Unknown ${c.unknown_persons ?? "-"}   In ${c.total_entries_today ?? "-"} / Out ${c.total_exits_today ?? "-"}`;
+      const banner = `Staff inside: ${c.current_staff_count ?? "-"}   Known ${c.known_staff ?? "-"} · Not identified ${c.unknown_persons ?? "-"}   In ${c.total_entries_today ?? "-"} / Out ${c.total_exits_today ?? "-"}`;
       ctx.font = "700 15px sans-serif";
       ctx.fillStyle = "rgba(0,0,0,0.6)";
       ctx.fillRect(8, 8, ctx.measureText(banner).width + 16, 26);

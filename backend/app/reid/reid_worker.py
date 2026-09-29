@@ -120,23 +120,30 @@ def _crop(frame: np.ndarray, bbox: list[float]) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
-def process_frame(camera_id: int, frame: np.ndarray, state: ReidWorkerState) -> dict | None:
+def process_frame(camera_id: int, frame: np.ndarray, state: ReidWorkerState, people: list[dict] | None = None,
+                  now: float | None = None) -> dict | None:
     """Returns {"tracks": [...]}, attached to detection_worker's result
     dict as result["reid"] when this cycle's MOT cadence fires; None when
     the cadence gate hasn't elapsed yet — same optional-key convention
-    peopleid_worker.process_frame already uses."""
-    now = time.time()
-    mot_interval = state.camera_config.get("mot_interval_seconds") or config.REID_MOT_INTERVAL_SECONDS
-    if now - state.last_mot_at < mot_interval:
-        return None
-    state.last_mot_at = now
+    peopleid_worker.process_frame already uses.
 
-    if state.tracker is None:
-        state.tracker = PersonBodyTracker(config.PEOPLEID_MOT_MODEL_PATH, config.PEOPLEID_MOT_IMGSZ, config.PEOPLEID_MOT_CONFIDENCE)
+    `people`: already-tracked people for this frame ({track_id, bbox,
+    confidence}) from the shared per-camera detector (person_detection.py),
+    which also paces the calls — so neither this module's own tracker nor
+    its cadence gate is used. Omit it to detect here (demo script, tests)."""
+    now = now if now is not None else time.time()
+    if people is None:
+        mot_interval = state.camera_config.get("mot_interval_seconds") or config.REID_MOT_INTERVAL_SECONDS
+        if now - state.last_mot_at < mot_interval:
+            return None
+        state.last_mot_at = now
+        if state.tracker is None:
+            state.tracker = PersonBodyTracker(config.PEOPLEID_MOT_MODEL_PATH, config.PEOPLEID_MOT_IMGSZ, config.PEOPLEID_MOT_CONFIDENCE)
+        people = state.tracker.update(frame)
+    else:
+        people = [p for p in people if p.get("track_id") is not None]
     if state.embedder is None:
         state.embedder = reid_embedding.BodyReIdEmbedder(config.REID_MODEL_NAME, config.REID_MODEL_PATH, config.REID_DEVICE)
-
-    people = state.tracker.update(frame)
     roi = state.camera_config.get("roi")
     track_results = []
     for person in people:
