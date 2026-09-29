@@ -1,37 +1,38 @@
 // ---------------------------------------------------------------------------
 // API CLIENT
-// This is the ONE file you need to edit to connect your backend.
-// Every page imports its data through the functions below instead of
-// importing mockData.js directly, so swapping mock -> real API is a
-// one-line change per function (remove the mock line, uncomment the fetch).
-//
-// Wired to the real wellmont FastAPI backend: auth, cameras, sites, and the
-// camera-count portion of the dashboard. Everything else (alerts, people,
-// attendance, workforce, footfall, intrusion, settings) has no backend yet
-// and still reads mockData — there's no detection/analytics pipeline behind
-// this app to serve real data for those.
+// Every page reads and writes backend data through the functions below.
+// There is no silent mock fallback: if the backend fails, the caller gets an
+// error and the page shows it, instead of plausible-looking fake data.
 // ---------------------------------------------------------------------------
 import * as mock from "../data/mockData";
 
-// Set this in a .env file as VITE_API_BASE_URL=https://your-api.example.com/api
-export const BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
+// Base URL of the backend API. In production this is normally the relative
+// "/api" (nginx serves the SPA and proxies /api and /ws to the backend on the
+// same origin), set via frontend/.env.production. A missing value is a build
+// configuration error, not something to guess around.
+export const BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+if (!BASE_URL) {
+  // eslint-disable-next-line no-console
+  console.error("VITE_API_BASE_URL is not set; API calls will fail. See frontend/.env.example.");
+}
 
-// Derived for the live-view websocket (camera_stream.py) — same host as
-// BASE_URL, minus the /api suffix and http(s) swapped for ws(s).
-const WS_ROOT = BASE_URL.replace(/\/api\/?$/, "");
-export const WS_HOST = WS_ROOT.replace(/^https?:\/\//, "");
-export const WS_PROTOCOL = WS_ROOT.startsWith("https") ? "wss" : "ws";
+// Development-only sample data (People page "validated guests", default
+// profile fields). Off unless explicitly enabled with VITE_DEMO_MODE=true.
+export const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === "true";
 
-// Called wherever a request comes back 401/403 while this browser THOUGHT
-// it had a valid session (deco_token was set) — that combination means
-// the session was revoked/expired server-side, or (for a client login)
-// the underlying license was just suspended/deactivated/expired (see
-// backend/app/auth.py's load_active_client_license, re-checked on every
-// request). Clearing storage and bouncing to the right login page is the
-// visible side of "access stops immediately", not just a 403 toast on
-// whatever page happened to be open. Does nothing for a failed LOGIN
-// attempt itself (no token was set yet), so it never interferes with the
-// error message a login form needs to show.
+// Websocket host/protocol: same origin as the API. A relative BASE_URL
+// ("/api") resolves against the page's own host, and https pages get wss.
+const API_URL = new URL(BASE_URL || "/api", window.location.origin);
+export const WS_HOST = API_URL.host;
+export const WS_PROTOCOL = API_URL.protocol === "https:" ? "wss" : "ws";
+
+// Called when a request comes back 401 while this browser THOUGHT it had a
+// valid session (deco_token was set): the session expired or was revoked
+// server-side (logout elsewhere, password change, license suspended). A 403
+// is different — the session is fine, this one action just isn't allowed
+// (e.g. a feature the license doesn't include) — so it never logs you out.
+// Does nothing for a failed LOGIN attempt (no token set yet), so it never
+// interferes with the error message a login form needs to show.
 function handleAuthFailure() {
   const hadToken = !!localStorage.getItem("deco_token");
   if (!hadToken) return;
@@ -63,20 +64,35 @@ async function request(path, options = {}) {
       ...(options.headers || {}),
     },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
-  if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`);
+  if (res.status === 401) handleAuthFailure();
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const err = new Error(body?.detail || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
 // ---- Auth ------------------------------------------------------------
-export async function login(email, _password) {
-  // Backend doesn't verify a password yet (no real auth) — it just records
-  // who signed in, same as the previous frontend's login. What IS real
-  // now: the token it returns is a genuine server-side session (see
-  // backend/app/auth.py) required on every subsequent admin request —
-  // previously this was a hardcoded client-side string nothing ever checked.
-  const data = await request("/auth/login", { method: "POST", body: JSON.stringify({ email }) });
-  return { token: data.token, user: { ...mock.currentUser, name: data.name, email: data.email } };
+// Admin login: email + password, verified server-side (backend/app/auth.py).
+// Throws with the backend's message ("Invalid email or password", or the
+// rate-limit message after too many failures).
+export async function login(email, password) {
+  const res = await fetch(`${BASE_URL}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail = typeof body?.detail === "string" ? body.detail : "Couldn't log in. Check your email and password.";
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  return { token: data.token, user: { role: "admin", name: data.name, email: data.email } };
 }
 export async function logoutAdmin() {
   try {
@@ -84,11 +100,6 @@ export async function logoutAdmin() {
   } catch {
     // best-effort — the local session is cleared either way by AuthContext.logout()
   }
-}
-
-export async function signup(payload) {
-  // No backend signup endpoint (no accounts/roles system built yet) — still mocked.
-  return Promise.resolve({ token: "demo-token", user: { ...mock.currentUser, ...payload } });
 }
 
 // ---- Dashboard ---------------------------------------------------------
@@ -177,7 +188,7 @@ export async function resolveAlert(id, reason) {
 }
 export async function fetchAlertSnapshotObjectUrl(id) {
   const res = await fetch(`${BASE_URL}/alerts/${id}/snapshot`, { headers: { ...authHeaders() } });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) throw new Error("No snapshot");
   return URL.createObjectURL(await res.blob());
 }
@@ -265,7 +276,7 @@ export async function testCameraStream(rtspUrl) {
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ rtsp_url: rtspUrl }),
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const err = await res.json().catch(() => null);
     throw new Error(err?.detail || `Couldn't reach the camera (${res.status})`);
@@ -302,9 +313,17 @@ export async function deleteSite(id) {
 
 // ---- People ----------------------------------------------------------
 // Real enrolled-face data lives on the separately deployed face-enrollment
-// service (not this repo's backend) — /api/faces returns each enrolled
-// person's name, unique employee ID and reference sample photos.
-const FACES_API_BASE = "http://13.61.58.14";
+// ("Identity") service. The browser never calls it directly: the backend
+// proxies it (/faces/identity/*, admin auth, configured IDENTITY_SERVICE_BASE),
+// which keeps this page working over HTTPS and keeps that service private.
+async function fetchIdentityRosterPhotoObjectUrl(path) {
+  const res = await fetch(`${BASE_URL}/faces/identity/photo?path=${encodeURIComponent(path)}`, {
+    headers: { ...authHeaders() },
+  });
+  if (res.status === 401) handleAuthFailure();
+  if (!res.ok) throw new Error(`Could not load photo (${res.status})`);
+  return URL.createObjectURL(await res.blob());
+}
 
 // ---- Manually enrolled Identity people ----------------------------------
 // People added by hand on the Identity page are saved in OUR backend's
@@ -343,7 +362,7 @@ export async function analyzeBehaviorFrame(blob) {
     body,
     headers: { ...authHeaders() },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const err = await res.json().catch(() => null);
     throw new Error(err?.detail || `Analyze failed (${res.status})`);
@@ -364,7 +383,7 @@ export async function enrollFacePhoto(employeeId, blob, filename = "face.jpg") {
     body,
     headers: { ...authHeaders() },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const err = await res.json().catch(() => null);
     throw new Error(err?.detail || `Photo upload failed (${res.status})`);
@@ -378,7 +397,7 @@ export async function fetchIdentityPhotoObjectUrl(embeddingId) {
   const res = await fetch(`${BASE_URL}/faces/people/photo/${embeddingId}`, {
     headers: { ...authHeaders() },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) throw new Error(`Could not load photo (${res.status})`);
   return URL.createObjectURL(await res.blob());
 }
@@ -412,12 +431,15 @@ async function getLocalIdentityRows() {
 export async function getPeople() {
   // Hand-entered people come from our own database and must show up even
   // if the external roster service is unreachable — they're independent
-  // sources, so a failure of one must not hide the other.
-  const localRows = await getLocalIdentityRows().catch(() => []);
+  // sources, so a failure of one must not hide the other. If BOTH fail the
+  // error propagates so the page can say so (never fake people).
+  let localError = null;
+  const localRows = await getLocalIdentityRows().catch((e) => {
+    localError = e;
+    return [];
+  });
   try {
-    const res = await fetch(`${FACES_API_BASE}/api/faces`);
-    if (!res.ok) throw new Error(`Faces API error ${res.status}`);
-    const rows = await res.json();
+    const rows = await facesRequest("/identity/roster");
     // The external service has no way to save an edited employee ID (see
     // setPersonEmployeeId) — its own employee_id field is often null/stale.
     // Our own backend's override, keyed by this same `name`, wins whenever
@@ -429,14 +451,21 @@ export async function getPeople() {
       // Best-effort — People page still works with the external service's
       // own (possibly stale) IDs if this backend is briefly unreachable.
     }
-    const externalRows = rows.map((r) => ({
-      name: r.name,
-      employeeId: overrides[r.name] || r.employee_id || "-",
-      designs: r.sample_count,
-      faceEnrolled: r.sample_count > 0,
-      enrollment: r.sample_count > 0 ? "Enrolled" : "Not enrolled",
-      photos: (r.photo_urls || []).map((path, i) => ({ id: `${r.name}-${i}`, url: `${FACES_API_BASE}${path}` })),
-    }));
+    const externalRows = await Promise.all(
+      rows.map(async (r) => ({
+        name: r.name,
+        employeeId: overrides[r.name] || r.employee_id || "-",
+        designs: r.sample_count,
+        faceEnrolled: r.sample_count > 0,
+        enrollment: r.sample_count > 0 ? "Enrolled" : "Not enrolled",
+        photos: await Promise.all(
+          (r.photo_urls || []).slice(0, 5).map(async (path, i) => ({
+            id: `${r.name}-${i}`,
+            url: await fetchIdentityRosterPhotoObjectUrl(path).catch(() => null),
+          }))
+        ),
+      }))
+    );
     // Merge by employee ID rather than dropping either side. When both
     // sources describe the same ID it's the same person — someone filled
     // in details locally for somebody the roster service also knows — so
@@ -463,10 +492,10 @@ export async function getPeople() {
     // without scrolling.
     const localIds = new Set(localRows.map((r) => r.employeeId));
     return [...mergedLocal, ...externalRows.filter((r) => !localIds.has(r.employeeId))];
-  } catch {
-    // External roster unreachable — still show what we have saved locally,
-    // and only fall back to mock data when there is nothing real at all.
-    return localRows.length ? localRows : mock.people;
+  } catch (e) {
+    // External roster unreachable — still show what we have saved locally.
+    if (localRows.length || !localError) return localRows;
+    throw e;
   }
 }
 // Persists an edited employee ID for a person from the People page — see
@@ -479,8 +508,9 @@ export function setPersonEmployeeId(name, employeeId) {
   });
 }
 export async function getValidatedPeople() {
-  // return request("/people/validated");
-  return Promise.resolve(mock.validatedPeople);
+  // No backend for validated guests exists yet. Sample rows only in an
+  // explicit demo build; otherwise an honest empty list.
+  return DEMO_MODE ? mock.validatedPeople : [];
 }
 // ---- Attendance --------------------------------------------------------
 // Marked from face recognition on cameras with it switched on
@@ -518,7 +548,7 @@ export async function getDeskReport(date) {
 // Latest still from any camera (starts it briefly if it isn't streaming).
 export async function fetchCameraFrameObjectUrl(cameraId) {
   const res = await fetch(`${BASE_URL}/cameras/${cameraId}/frame`, { headers: { ...authHeaders() } });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const err = await res.json().catch(() => null);
     throw new Error(err?.detail || `No picture from this camera (${res.status})`);
@@ -547,7 +577,7 @@ export async function setFootfallZone(cameraId, roi) {
 }
 export async function fetchFootfallFrameObjectUrl(cameraId) {
   const res = await fetch(`${BASE_URL}/footfall/cameras/${cameraId}/frame`, { headers: { ...authHeaders() } });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) throw new Error(`No frame from this camera yet (${res.status})`);
   return URL.createObjectURL(await res.blob());
 }
@@ -555,7 +585,7 @@ export async function fetchFootfallFrameObjectUrl(cameraId) {
 // reasoning as fetchTrainingImageObjectUrl.
 export async function fetchFootfallSnapshotObjectUrl(snapshotId) {
   const res = await fetch(`${BASE_URL}/footfall/snapshots/${snapshotId}`, { headers: { ...authHeaders() } });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) throw new Error(`Could not load snapshot (${res.status})`);
   return URL.createObjectURL(await res.blob());
 }
@@ -621,21 +651,24 @@ export function staffSocketUrl(path) {
 // silently revert on the next page load/navigation, since getProfile() would
 // keep returning the pristine mock object. AuthContext.updateUser() keeps
 // the Topbar/sidebar in sync with these edits within the same session.
+// Profile display fields only (name, avatar, phone) — kept in this browser.
+// Identity and permissions always come from the server session, never from
+// these fields.
+const EMPTY_PROFILE = { name: "", email: "", phone: "", role: "" };
 export async function getProfile() {
-  // return request("/me");
+  const base = DEMO_MODE ? mock.currentUser : EMPTY_PROFILE;
   try {
     const saved = localStorage.getItem("deco_user");
-    if (saved) return Promise.resolve({ ...mock.currentUser, ...JSON.parse(saved) });
+    if (saved) return { ...base, ...JSON.parse(saved) };
   } catch {
     // corrupt/unavailable localStorage — fall through to the default profile
   }
-  return Promise.resolve(mock.currentUser);
+  return base;
 }
 export async function updateProfile(payload) {
-  // return request("/me", { method: "PATCH", body: JSON.stringify(payload) });
   try {
     const saved = localStorage.getItem("deco_user");
-    const merged = { ...(saved ? JSON.parse(saved) : mock.currentUser), ...payload };
+    const merged = { ...(saved ? JSON.parse(saved) : EMPTY_PROFILE), ...payload };
     localStorage.setItem("deco_user", JSON.stringify(merged));
   } catch {
     // localStorage unavailable (e.g. private browsing) — edit still applies
@@ -654,7 +687,7 @@ async function trainingRequest(path, options = {}) {
     ...options,
     headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${res.status})`);
@@ -669,7 +702,7 @@ async function facesRequest(path, options = {}) {
     ...options,
     headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${res.status})`);
@@ -694,7 +727,7 @@ export async function fetchTrainingImageObjectUrl(captureId) {
   const res = await fetch(`${BASE_URL}/faces/training/image/${captureId}`, {
     headers: { ...authHeaders() },
   });
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) throw new Error(`Could not load image (${res.status})`);
   const blob = await res.blob();
   return URL.createObjectURL(blob);
@@ -740,7 +773,7 @@ async function licenseRequest(path, options = {}) {
   });
   // Not for /client-login itself — a failed login attempt has no token
   // set yet, so handleAuthFailure() is a no-op there (see its own comment).
-  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  if (res.status === 401) handleAuthFailure();
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new Error(body?.detail || `Request failed (${res.status})`);
@@ -826,6 +859,9 @@ export function setCameraFeatures(id, cameraId, featureKeys) {
     body: JSON.stringify({ feature_keys: featureKeys }),
   });
 }
-export function licenseQrUrl(id) {
-  return `${BASE_URL}/licenses/${id}/qr`;
+export async function fetchLicenseQrObjectUrl(id) {
+  const res = await fetch(`${BASE_URL}/licenses/${encodeURIComponent(id)}/qr`, { headers: { ...authHeaders() } });
+  if (res.status === 401) handleAuthFailure();
+  if (!res.ok) throw new Error(`Could not load QR code (${res.status})`);
+  return URL.createObjectURL(await res.blob());
 }

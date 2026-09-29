@@ -61,14 +61,6 @@ export function AuthProvider({ children }) {
     return clientUser;
   }, []);
 
-  const signup = useCallback(async (payload) => {
-    const res = await api.signup(payload);
-    localStorage.setItem("deco_token", res.token);
-    localStorage.setItem("deco_user", JSON.stringify(res.user));
-    setUser(res.user);
-    return res.user;
-  }, []);
-
   const logout = useCallback(() => {
     // Best-effort server-side revoke — the local session clears either
     // way, but this stops the token from working if it leaked (e.g. was
@@ -113,7 +105,7 @@ export function AuthProvider({ children }) {
   }, [user?.role]);
 
   return (
-    <AuthContext.Provider value={{ user, login, loginAsClient, signup, logout, updateUser }}>
+    <AuthContext.Provider value={{ user, login, loginAsClient, logout, updateUser }}>
       {children}
     </AuthContext.Provider>
   );

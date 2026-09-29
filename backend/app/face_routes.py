@@ -18,15 +18,18 @@ Endpoints:
                                          enough captures to be a classifier class
 """
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+import logging
 import os
-import uuid
-from pathlib import Path
+import re
 
-from app import auth, face_db
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
+
+from app import auth, config, face_db, storage, uploads
 from app.face_pipeline import CameraFacePipeline
+
+log = logging.getLogger("face_routes")
 
 # Admin-only for every route in this router: this is the internal
 # review-queue/enrollment tooling, not something the client portal calls
@@ -36,13 +39,22 @@ from app.face_pipeline import CameraFacePipeline
 # could assign/ignore review captures or add arbitrary face embeddings.
 router = APIRouter(prefix="/api/faces", tags=["faces"], dependencies=[Depends(auth.require_admin)])
 
-# Resolved relative to this file, not cwd — see the note in face_pipeline.py
-# (_DATA_DIR) for why a plain "backend/data/..." relative default is wrong
-# for how this project actually launches uvicorn.
-ENROLL_DIR = os.environ.get(
-    "FACE_ENROLL_DIR", str(Path(__file__).resolve().parent.parent / "data" / "face_enroll")
-)
+ENROLL_DIR = os.environ.get("FACE_ENROLL_DIR", str(config.DATA_DIR / "face_enroll"))
 os.makedirs(ENROLL_DIR, exist_ok=True)
+
+
+async def _read_upload(upload: UploadFile) -> bytes:
+    """At most MAX_UPLOAD_BYTES + 1 bytes: enough for decode_image to tell an
+    oversized file apart without reading all of it into memory."""
+    return await upload.read(config.MAX_UPLOAD_BYTES + 1)
+
+
+def _largest_face(img):
+    CameraFacePipeline._ensure_arcface_loaded()
+    faces = CameraFacePipeline._arcface.get(img)
+    if not faces:
+        return None
+    return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
 
 class AssignRequest(BaseModel):
@@ -83,30 +95,27 @@ def ignore(req: IgnoreRequest):
 async def enroll(person_id: str = Form(...), photo: UploadFile = File(...)):
     """Direct enrollment path (e.g. from the People page's existing photo
     upload UI) — bypasses the review queue since the human is already
-    confirming identity by uploading it against a specific person_id."""
-    contents = await photo.read()
-    ext = os.path.splitext(photo.filename or "")[1] or ".jpg"
-    path = os.path.join(ENROLL_DIR, f"{person_id}_{uuid.uuid4().hex[:8]}{ext}")
-    with open(path, "wb") as f:
-        f.write(contents)
+    confirming identity by uploading it against a specific person_id.
 
-    import cv2
-    import numpy as np
-    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image")
+    Nothing is written to disk until the id is valid, the bytes are a real
+    image within the size limit, and a face was found in it; the stored file
+    is a server-side re-encode under a server-generated name (uploads.py)."""
+    try:
+        person_id = uploads.validate_identifier(person_id)
+        img = uploads.decode_image(await _read_upload(photo))
+    except uploads.UploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     # Only the embedding model is needed here — this photo is already a
     # framed, human-confirmed face, so there's no detection/tracking step
     # to run first. Deliberately not _ensure_models_loaded(), which would
     # also require the YOLO face-detection weights just to enroll a photo.
-    CameraFacePipeline._ensure_arcface_loaded()
-    faces = CameraFacePipeline._arcface.get(img)
-    if not faces:
+    face = _largest_face(img)
+    if face is None:
         raise HTTPException(status_code=422, detail="No face detected in photo")
-    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
 
-    face_db.add_embedding(person_id, face.normed_embedding.tolist(), source_image_path=path)
+    path = uploads.save_image(img, ENROLL_DIR, person_id)
+    face_db.add_embedding(person_id, face.normed_embedding.tolist(), source_image_path=storage.to_stored(path))
     return {"ok": True, "person_id": person_id, "total_embeddings": face_db.count_embeddings_for_person(person_id)}
 
 
@@ -165,14 +174,10 @@ async def behavior_analyze(frame: UploadFile = File(...)):
     beat after the first frame rather than blocking on it — deliberate,
     and the same throttling behaviour the live pipeline relies on.
     """
-    import cv2
-    import numpy as np
-
-
-    contents = await frame.read()
-    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode frame")
+    try:
+        img = uploads.decode_image(await _read_upload(frame))
+    except uploads.UploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     from app import behavior_webcam
 
@@ -236,6 +241,10 @@ def save_identity_person(req: IdentityPersonIn):
         raise HTTPException(status_code=422, detail="Employee ID is required")
     if not name:
         raise HTTPException(status_code=422, detail="Name is required")
+    try:
+        uploads.validate_identifier(employee_id, "Employee ID")
+    except uploads.UploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
 
     saved = face_db.upsert_manual_person(
         employee_id=employee_id,
@@ -274,17 +283,92 @@ def identity_person_photo(embedding_id: int):
     row = face_db.get_embedding_row(embedding_id)
     if row is None:
         raise HTTPException(status_code=404, detail="No such enrolled photo")
-    path = row.get("source_image_path")
-    if not path or not os.path.exists(path):
+    path = storage.resolve(row.get("source_image_path"))
+    if path is None or not path.is_file():
         raise HTTPException(status_code=404, detail="Enrolled image file is no longer on disk")
     return FileResponse(path)
 
 
-# Same external enrollment service the People/Identity page reads (see
-# client.js's FACES_API_BASE and face_training_routes.EXTERNAL_FACES_API)
-# — the Identity roster and its reference photos live there, not in this
-# repo's DB.
-IDENTITY_SERVICE_BASE = os.environ.get("IDENTITY_SERVICE_BASE", "http://13.61.58.14")
+# ---------------------------------------------------------------------------
+# External Identity (face-enrollment) service. Its roster and reference
+# photos live there, not in this repo's DB. The browser used to fetch it
+# directly over plain HTTP from a hardcoded IP, which breaks (mixed content)
+# as soon as the app is served over HTTPS and exposes the service to every
+# client. It is now reached only from this backend, at the configured
+# IDENTITY_SERVICE_BASE, behind admin auth.
+# ---------------------------------------------------------------------------
+
+# Photo paths the external service hands out look like "/uploads/x/1.jpg".
+_IDENTITY_PHOTO_PATH_RE = re.compile(r"^/[A-Za-z0-9._~%/-]{1,512}$")
+
+
+def _identity_base() -> str:
+    if not config.IDENTITY_SERVICE_BASE:
+        raise HTTPException(status_code=503, detail="The Identity enrollment service is not configured (IDENTITY_SERVICE_BASE)")
+    return config.IDENTITY_SERVICE_BASE
+
+
+def _identity_get(path: str, max_bytes: int = 20 * 1024 * 1024) -> bytes:
+    import urllib.error
+    import urllib.request
+
+    url = f"{_identity_base()}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=config.EXTERNAL_HTTP_TIMEOUT) as resp:
+            data = resp.read(max_bytes + 1)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        log.warning("identity service request failed: %s %s", path, type(e).__name__)
+        raise HTTPException(status_code=502, detail="Could not reach the Identity enrollment service")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=502, detail="Identity service response too large")
+    return data
+
+
+def _valid_identity_photo_path(path: str) -> bool:
+    return bool(path) and bool(_IDENTITY_PHOTO_PATH_RE.match(path)) and ".." not in path and "//" not in path
+
+
+def fetch_identity_roster() -> list[dict]:
+    import json as _json
+
+    try:
+        roster = _json.loads(_identity_get("/api/faces"))
+    except ValueError:
+        raise HTTPException(status_code=502, detail="The Identity enrollment service returned invalid data")
+    if not isinstance(roster, list):
+        raise HTTPException(status_code=502, detail="The Identity enrollment service returned invalid data")
+    return roster
+
+
+@router.get("/identity/roster")
+def identity_roster():
+    """The external roster, proxied: [{name, employee_id, sample_count,
+    photo_urls: [path, ...]}]. Photos are then fetched through
+    /identity/photo below, never directly by the browser."""
+    out = []
+    for row in fetch_identity_roster():
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "name": row.get("name"),
+            "employee_id": row.get("employee_id"),
+            "sample_count": row.get("sample_count") or 0,
+            "photo_urls": [p for p in (row.get("photo_urls") or []) if isinstance(p, str) and _valid_identity_photo_path(p)],
+        })
+    return out
+
+
+@router.get("/identity/photo")
+def identity_photo(path: str):
+    if not _valid_identity_photo_path(path):
+        raise HTTPException(status_code=400, detail="Invalid photo path")
+    data = _identity_get(path, max_bytes=config.MAX_UPLOAD_BYTES * 2)
+    try:
+        uploads.decode_image(data, max_bytes=config.MAX_UPLOAD_BYTES * 2)
+    except uploads.UploadError:
+        raise HTTPException(status_code=502, detail="The Identity service returned something that is not an image")
+    media = "image/png" if data.startswith(b"\x89PNG") else "image/jpeg"
+    return Response(content=data, media_type=media, headers={"Cache-Control": "private, max-age=300"})
 
 
 @router.post("/gallery/sync-from-identity")
@@ -304,32 +388,34 @@ def sync_gallery_from_identity(force: bool = False, max_photos_per_person: int =
     already has embeddings is skipped unless force=true, and nothing is
     ever deleted — existing embeddings, captures and training data are
     untouched.
+
+    Everything from the external service is untrusted: employee ids must
+    pass the same identifier check as a manual upload (a malformed one is
+    skipped, never used in a path), photo paths must look like plain URL
+    paths, and every photo must decode as a real image within the size cap.
     """
-    import json as _json
-    import urllib.error
-    import urllib.request
-
-    import cv2
-    import numpy as np
-
-    try:
-        with urllib.request.urlopen(f"{IDENTITY_SERVICE_BASE}/api/faces", timeout=15) as resp:
-            roster = _json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach the Identity enrollment service: {e}")
+    roster = fetch_identity_roster()
 
     # That service's own employee_id field is frequently null/stale, so a
     # local override keyed by name wins where one exists — same precedence
     # the People page itself uses.
     overrides = face_db.get_person_employee_id_overrides()
-    CameraFacePipeline._ensure_arcface_loaded()
+    max_photos_per_person = max(1, min(max_photos_per_person, 20))
 
     people, skipped_no_employee_id, skipped_already_enrolled, photos_without_face = [], 0, 0, 0
+    skipped_invalid = 0
     for row in roster:
+        if not isinstance(row, dict):
+            continue
         name = (row.get("name") or "").strip()
         employee_id = overrides.get(name) or row.get("employee_id")
         if not employee_id:
             skipped_no_employee_id += 1
+            continue
+        try:
+            employee_id = uploads.validate_identifier(str(employee_id), "employee_id")
+        except uploads.UploadError:
+            skipped_invalid += 1
             continue
         if not force and face_db.count_embeddings_for_person(employee_id) > 0:
             skipped_already_enrolled += 1
@@ -337,26 +423,18 @@ def sync_gallery_from_identity(force: bool = False, max_photos_per_person: int =
 
         added = 0
         for photo_path in (row.get("photo_urls") or [])[:max_photos_per_person]:
-            url = f"{IDENTITY_SERVICE_BASE}{photo_path}"
+            if not isinstance(photo_path, str) or not _valid_identity_photo_path(photo_path):
+                continue
             try:
-                with urllib.request.urlopen(url, timeout=15) as r:
-                    contents = r.read()
-            except (urllib.error.URLError, TimeoutError):
+                img = uploads.decode_image(_identity_get(photo_path, max_bytes=config.MAX_UPLOAD_BYTES))
+            except (HTTPException, uploads.UploadError):
                 continue
-            img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            faces = CameraFacePipeline._arcface.get(img)
-            if not faces:
+            face = _largest_face(img)
+            if face is None:
                 photos_without_face += 1
                 continue
-            face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-
-            ext = os.path.splitext(photo_path)[1] or ".jpg"
-            local_path = os.path.join(ENROLL_DIR, f"{employee_id}_{uuid.uuid4().hex[:8]}{ext}")
-            with open(local_path, "wb") as f:
-                f.write(contents)
-            face_db.add_embedding(employee_id, face.normed_embedding.tolist(), source_image_path=local_path)
+            local_path = uploads.save_image(img, ENROLL_DIR, employee_id)
+            face_db.add_embedding(employee_id, face.normed_embedding.tolist(), source_image_path=storage.to_stored(local_path))
             added += 1
 
         if added:
@@ -367,6 +445,7 @@ def sync_gallery_from_identity(force: bool = False, max_photos_per_person: int =
         "embeddings_added": sum(p["embeddings_added"] for p in people),
         "skipped_already_enrolled": skipped_already_enrolled,
         "skipped_no_employee_id": skipped_no_employee_id,
+        "skipped_invalid_employee_id": skipped_invalid,
         "photos_without_detectable_face": photos_without_face,
         "people": people,
     }
@@ -386,5 +465,11 @@ def get_people_id_overrides():
 
 @router.post("/people-id-overrides")
 def set_people_id_override(req: PersonIdOverrideRequest):
-    face_db.set_person_employee_id(req.name, req.employee_id)
+    try:
+        employee_id = uploads.validate_identifier(req.employee_id.strip(), "employee_id")
+    except uploads.UploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    if not req.name.strip() or len(req.name) > 200:
+        raise HTTPException(status_code=422, detail="A name is required")
+    face_db.set_person_employee_id(req.name, employee_id)
     return {"ok": True}

@@ -19,6 +19,19 @@ from app.staff import service as svc_mod
 router = APIRouter(prefix="/api/staff", tags=["staff"])
 service = svc_mod.service
 
+# Tenant scoping: an admin sees every camera; a client only sees Staff Count
+# if their license includes attendance (the same feature the sidebar gates
+# the page on) and only for visits/events on cameras assigned to them.
+_staff_viewer = auth.require_feature("attendance")
+
+
+def _scope(principal: dict) -> set[int] | None:
+    return auth.allowed_camera_ids(principal)
+
+
+def _in_scope(rows: list[dict], cams: set[int] | None) -> list[dict]:
+    return rows if cams is None else [r for r in rows if r.get("camera_id") in cams]
+
 
 def _today_start() -> float:
     return datetime.datetime.combine(datetime.date.today(), datetime.time()).timestamp()
@@ -35,38 +48,40 @@ def _with_names(rows: list[dict]) -> list[dict]:
 
 
 @router.get("/count")
-def staff_count(_: dict = Depends(auth.get_principal)):
-    return service.count()
+def staff_count(principal: dict = Depends(_staff_viewer)):
+    return service.count(camera_ids=_scope(principal))
 
 
 @router.get("/present")
-def staff_present(_: dict = Depends(auth.get_principal)):
+def staff_present(principal: dict = Depends(_staff_viewer)):
     """Everyone inside now (named employees and anonymous people), plus
     employees who were in earlier today and have left."""
+    cams = _scope(principal)
     m = service.manager
     rows = [{"visit_id": v["visit_id"], "employee_id": v.get("employee_id"), "status": "PRESENT",
              "entry_time": v["entry_time"], "last_seen": v["last_seen"], "camera_id": v.get("camera_id"),
-             "confidence": v.get("confidence")} for v in m._present.values()]
+             "confidence": v.get("confidence")} for v in list(m._present.values())]
     present_emps = {r["employee_id"] for r in rows if r["employee_id"]}
     rows += [dict(r, status="EXITED") for r in m.employees_today() if r["status"] == "EXITED" and r["employee_id"] not in present_emps]
+    rows = _in_scope(rows, cams)
     for r in rows:
         r["ts"] = r["last_seen"]
     return _with_names(rows)
 
 
 @router.get("/events")
-def staff_events(event_type: str | None = None, limit: int = 200, _: dict = Depends(auth.get_principal)):
-    return _with_names(service.manager.events(event_type, max(1, min(limit, 1000))))
+def staff_events(event_type: str | None = None, limit: int = 200, principal: dict = Depends(_staff_viewer)):
+    return _with_names(service.manager.events(event_type, max(1, min(limit, 1000)), camera_ids=_scope(principal)))
 
 
 @router.get("/entries")
-def staff_entries(_: dict = Depends(auth.get_principal)):
-    return _with_names(service.manager.events("ENTRY", 500, since=_today_start()))
+def staff_entries(principal: dict = Depends(_staff_viewer)):
+    return _with_names(service.manager.events("ENTRY", 500, since=_today_start(), camera_ids=_scope(principal)))
 
 
 @router.get("/exits")
-def staff_exits(_: dict = Depends(auth.get_principal)):
-    return _with_names(service.manager.events("EXIT", 500, since=_today_start()))
+def staff_exits(principal: dict = Depends(_staff_viewer)):
+    return _with_names(service.manager.events("EXIT", 500, since=_today_start(), camera_ids=_scope(principal)))
 
 
 @router.get("/status")
@@ -113,28 +128,47 @@ def reset_occupancy(payload: ResetIn, _: dict = Depends(auth.require_admin)):
     return {"closed": service.manager.auto_exit_all(reason=payload.reason)}
 
 
-def register_websockets(app, authorize) -> None:
+def _ws_scope(token: str | None) -> tuple[bool, set[int] | None]:
+    """(allowed, camera scope) for a websocket token, re-evaluated on every
+    push so a suspended license or revoked session stops the stream."""
+    session = auth.get_session(token)
+    if session is None:
+        return False, None
+    try:
+        _staff_viewer(session)
+        return True, _scope(session)
+    except HTTPException:
+        return False, None
+
+
+def register_websockets(app) -> None:
     @app.websocket("/ws/staff")
     async def ws_staff(websocket: WebSocket, token: str | None = None):
         await websocket.accept()
-        if not authorize(token):
-            await websocket.close(code=4401)
-            return
         try:
             while True:
-                await websocket.send_json(service.count())
+                allowed, cams = _ws_scope(token)
+                if not allowed:
+                    await websocket.close(code=4401)
+                    return
+                await websocket.send_json(service.count(camera_ids=cams))
                 await asyncio.sleep(2)
         except WebSocketDisconnect:
             pass
 
     @app.websocket("/ws/staff/debug/{camera_id}")
     async def ws_staff_debug(websocket: WebSocket, camera_id: int, token: str | None = None):
+        # Admin-only diagnostic (raw tracks, line geometry, per-frame state).
         await websocket.accept()
-        if not authorize(token):
-            await websocket.close(code=4401)
+        session = auth.get_session(token)
+        if session is None or session["principal_type"] != auth.ADMIN:
+            await websocket.close(code=4403)
             return
         try:
             while True:
+                if auth.get_session(token) is None:
+                    await websocket.close(code=4401)
+                    return
                 await websocket.send_json(service.debug(camera_id))
                 await asyncio.sleep(0.25)
         except WebSocketDisconnect:

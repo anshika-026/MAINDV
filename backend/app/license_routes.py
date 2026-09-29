@@ -21,11 +21,11 @@ from __future__ import annotations
 
 from datetime import datetime, time as dtime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app import auth, camera_db, license_db, license_qr
+from app import audit, auth, camera_db, license_db, license_qr, ratelimit
 
 router = APIRouter(prefix="/api/licenses", tags=["licenses"])
 
@@ -127,8 +127,8 @@ class LicenseCredentialsIn(BaseModel):
 
 
 class ClientLoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 def _license_public(row: dict) -> dict:
@@ -184,7 +184,7 @@ def create_license(payload: LicenseIn, _: dict = Depends(auth.require_admin)):
 
 
 @router.put("/{license_id}/credentials")
-def reset_license_credentials(license_id: str, payload: LicenseCredentialsIn, _: dict = Depends(auth.require_admin)):
+def reset_license_credentials(license_id: str, payload: LicenseCredentialsIn, principal: dict = Depends(auth.require_admin)):
     """Admin resets a client's portal username/password (e.g. they forgot
     it, or it needs rotating) — there's no self-service "forgot password"
     flow since there's no email-sending infrastructure in this app."""
@@ -197,11 +197,14 @@ def reset_license_credentials(license_id: str, payload: LicenseCredentialsIn, _:
     if license_db.username_taken(payload.username.strip(), exclude_license_id=license_id):
         raise HTTPException(status_code=409, detail=f"Username '{payload.username}' is already taken")
     lic = license_db.set_license_credentials(license_id, payload.username.strip(), payload.password)
+    # New credentials must end every session opened with the old ones.
+    revoked = auth.revoke_license_sessions(license_id)
+    audit.record("license.credentials_reset", principal, target=f"license:{license_id}", sessions_revoked=revoked)
     return _license_public(lic)
 
 
 @router.post("/client-login")
-def client_login(payload: ClientLoginIn):
+def client_login(payload: ClientLoginIn, request: Request):
     """Client-portal login — separate from the existing admin /api/auth/login.
     A license's username/password lets that client sign in from any
     browser/device, unlike a device-bound QR/key. On success, issues a
@@ -209,10 +212,18 @@ def client_login(payload: ClientLoginIn):
     subsequent request re-validates this license's status/expiry fresh
     from the DB (see auth.load_active_client_license), so a suspend/
     expiry takes effect on the client's very next request, not just their
-    next login."""
-    lic = license_db.verify_license_login(payload.username.strip(), payload.password)
+    next login.
+
+    Failed attempts are throttled per IP and per username (ratelimit.py)."""
+    ip = ratelimit.client_ip(request)
+    username = payload.username.strip()
+    guard = ratelimit.client_login_guard
+    guard.check(ip, username)
+    lic = license_db.verify_license_login(username, payload.password)
     if lic is None:
+        guard.failed(ip, username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    guard.succeeded(ip, username)
     effective = license_db.effective_status(lic)
     if effective != license_db.STATUS_ACTIVE:
         raise HTTPException(
@@ -288,20 +299,26 @@ def update_license(license_id: str, payload: LicenseUpdate, _: dict = Depends(au
 
 
 @router.post("/{license_id}/status")
-def set_license_status(license_id: str, payload: LicenseStatusIn, _: dict = Depends(auth.require_admin)):
+def set_license_status(license_id: str, payload: LicenseStatusIn, principal: dict = Depends(auth.require_admin)):
     if license_db.get_license(license_id) is None:
         raise HTTPException(status_code=404, detail="License not found")
     if payload.status not in license_db.ALL_STATUSES:
         raise HTTPException(status_code=422, detail=f"Invalid status '{payload.status}'")
     lic = license_db.set_license_status(license_id, payload.status)
+    revoked = 0
+    if payload.status != license_db.STATUS_ACTIVE:
+        revoked = auth.revoke_license_sessions(license_id)
+    audit.record("license.status", principal, target=f"license:{license_id}", status=payload.status, sessions_revoked=revoked)
     return _license_public(lic)
 
 
 @router.delete("/{license_id}")
-def delete_license(license_id: str, _: dict = Depends(auth.require_admin)):
+def delete_license(license_id: str, principal: dict = Depends(auth.require_admin)):
     if license_db.get_license(license_id) is None:
         raise HTTPException(status_code=404, detail="License not found")
     license_db.delete_license(license_id)
+    auth.revoke_license_sessions(license_id)
+    audit.record("license.delete", principal, target=f"license:{license_id}")
     return {"ok": True}
 
 

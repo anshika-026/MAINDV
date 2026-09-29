@@ -8,6 +8,7 @@ import Modal from "../components/Modal";
 import StaffEntranceEditor from "../components/StaffEntranceEditor";
 import StaffDebugView from "../components/StaffDebugView";
 import * as api from "../api/client";
+import { useAuth } from "../context/AuthContext";
 
 // Staff Count (backend/app/staff/): who is inside the office right now, from
 // entry/exit line crossings at entrance cameras. The number is the backend's
@@ -35,6 +36,10 @@ export default function StaffCount() {
   const [status, setStatus] = useState(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [debugCam, setDebugCam] = useState(null);
+  // Entrance setup and the raw debug stream are admin tools (the backend
+  // refuses them for client sessions); a client sees the counts only.
+  const { user } = useAuth();
+  const isAdmin = user?.role !== "client";
   const [confirmReset, setConfirmReset] = useState(false);
   const [error, setError] = useState("");
 
@@ -97,6 +102,7 @@ export default function StaffCount() {
       <PageHeader
         title="Staff Count"
         action={
+          isAdmin && (
           <div className="flex flex-wrap gap-2">
             {entrances.length > 0 && (
               <button onClick={() => setDebugCam(entrances[0].camera_id)} className="btn-secondary text-sm flex items-center gap-1.5">
@@ -107,6 +113,7 @@ export default function StaffCount() {
               <DoorOpen size={14} /> Set up entrance
             </button>
           </div>
+          )
         }
       />
       {error && <p className="text-sm text-danger-500">{error}</p>}

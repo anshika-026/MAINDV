@@ -28,18 +28,15 @@ Endpoints:
   GET  /api/faces/training/collection/status     -> full session + per-camera monitoring (see below)
 """
 
-import json
 import os
 import shutil
 import time
-import urllib.error
-import urllib.request
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from app import auth, camera_db, employee_directory, face_collection, face_db, face_training_scheduler
+from app import auth, camera_db, employee_directory, face_collection, face_db, face_training_scheduler, storage, uploads
 from app.face_pipeline import (
     CLASSIFIER_PATH,
     MAX_CAPTURES_PER_CAMERA,
@@ -60,10 +57,25 @@ STALLED_THRESHOLD_SECONDS = 2 * 3600
 # entirely unauthenticated before this change.
 router = APIRouter(prefix="/api/faces/training", tags=["face-training"], dependencies=[Depends(auth.require_admin)])
 
-# Not part of this repo — see BACKEND_HANDOFF.md. Only ever called explicitly
-# via /employees/sync, never automatically, so the labeling/training
-# pipeline never depends on this host being reachable at request time.
-EXTERNAL_FACES_API = "http://13.61.58.14/api/faces"
+
+def _checked_employee_id(employee_id: str) -> str:
+    """Employee ids become folder names under TRAINING_CAPTURE_DIR, so they
+    must be plain identifiers — never '..', a slash or a drive letter."""
+    try:
+        return uploads.validate_identifier(employee_id, "employee_id")
+    except uploads.UploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
+def _employee_dir(employee_id: str) -> str:
+    target = uploads.safe_child(TRAINING_CAPTURE_DIR, _checked_employee_id(employee_id))
+    target.mkdir(parents=True, exist_ok=True)
+    return str(target)
+
+
+def _image_path(row: dict) -> str | None:
+    p = storage.resolve(row.get("image_path"))
+    return str(p) if p is not None and p.is_file() else None
 
 
 class LabelRequest(BaseModel):
@@ -125,7 +137,7 @@ def next_capture():
     # of leaving the labeling queue stuck serving a 404 image forever.
     row = face_db.get_next_unlabeled_capture()
     auto_skipped_missing = 0
-    while row is not None and not os.path.exists(row["image_path"]):
+    while row is not None and _image_path(row) is None:
         face_db.skip_training_capture(row["id"])
         auto_skipped_missing += 1
         row = face_db.get_next_unlabeled_capture()
@@ -149,13 +161,15 @@ def capture_image(capture_id: int):
     row = face_db.get_training_capture(capture_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Capture not found")
-    if not os.path.exists(row["image_path"]):
+    path = _image_path(row)
+    if path is None:
         raise HTTPException(status_code=404, detail="Image file missing on disk")
-    return FileResponse(row["image_path"], media_type="image/jpeg")
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @router.post("/label")
 def label(req: LabelRequest):
+    _checked_employee_id(req.employee_id)
     if not face_db.employee_exists(req.employee_id):
         raise HTTPException(
             status_code=422,
@@ -169,24 +183,23 @@ def label(req: LabelRequest):
         raise HTTPException(status_code=404, detail="Capture not found")
     if row["label_status"] != "unlabeled":
         raise HTTPException(status_code=409, detail=f"Capture already {row['label_status']}")
-    if not os.path.exists(row["image_path"]):
+    src_path = _image_path(row)
+    if src_path is None:
         # Same "file provably missing" case /next auto-skips — reachable
         # here only if the file disappeared between /next and this call.
         face_db.skip_training_capture(req.capture_id)
         raise HTTPException(status_code=410, detail="Image file is missing on disk — capture skipped automatically")
 
-    dest_dir = os.path.join(TRAINING_CAPTURE_DIR, req.employee_id)
-    os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, os.path.basename(row["image_path"]))
-    shutil.move(row["image_path"], dest_path)
+    dest_path = os.path.join(_employee_dir(req.employee_id), os.path.basename(src_path))
+    shutil.move(src_path, dest_path)
 
     try:
-        face_db.label_training_capture(req.capture_id, req.employee_id, dest_path)
+        face_db.label_training_capture(req.capture_id, req.employee_id, storage.to_stored(dest_path))
     except ValueError as e:
         # DB write failed after the file was already moved — move it back
         # so the capture doesn't end up orphaned (file relocated, row still
         # says unlabeled at the old path).
-        shutil.move(dest_path, row["image_path"])
+        shutil.move(dest_path, src_path)
         raise HTTPException(status_code=409, detail=str(e))
 
     return {"ok": True}
@@ -206,12 +219,12 @@ def _move_for_label(row: dict, employee_id: str) -> str:
     returns the new path. Handles both 'this file is still in the
     _unlabeled staging dir' (a skipped capture being labeled for the first
     time) and 'this file is already under a different employee's folder'
-    (correcting an existing label)."""
-    dest_dir = os.path.join(TRAINING_CAPTURE_DIR, employee_id)
-    os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, os.path.basename(row["image_path"]))
-    if os.path.abspath(row["image_path"]) != os.path.abspath(dest_path):
-        shutil.move(row["image_path"], dest_path)
+    (correcting an existing label). `row["image_path"]` must already be
+    resolved to an existing absolute path."""
+    src = row["image_path"]
+    dest_path = os.path.join(_employee_dir(employee_id), os.path.basename(src))
+    if os.path.abspath(src) != os.path.abspath(dest_path):
+        shutil.move(src, dest_path)
     return dest_path
 
 
@@ -220,6 +233,7 @@ def relabel(req: RelabelRequest):
     """Corrects the employee_id on a capture that was already labeled or
     skipped — the fix for 'I typed the wrong ID'. Unlike /label, this
     accepts a capture that isn't currently 'unlabeled'."""
+    _checked_employee_id(req.employee_id)
     if not face_db.employee_exists(req.employee_id):
         raise HTTPException(
             status_code=422,
@@ -236,16 +250,17 @@ def relabel(req: RelabelRequest):
             status_code=409,
             detail=f"Capture is {row['label_status']} — use /label for an unlabeled capture instead",
         )
-    if not os.path.exists(row["image_path"]):
+    src_path = _image_path(row)
+    if src_path is None:
         raise HTTPException(status_code=410, detail="Image file is missing on disk — cannot relabel")
 
-    dest_path = _move_for_label(row, req.employee_id)
+    dest_path = _move_for_label({**row, "image_path": src_path}, req.employee_id)
     try:
-        face_db.relabel_training_capture(req.capture_id, req.employee_id, dest_path)
+        face_db.relabel_training_capture(req.capture_id, req.employee_id, storage.to_stored(dest_path))
     except ValueError as e:
         # Move it back to exactly where it was so nothing is orphaned.
-        if os.path.abspath(dest_path) != os.path.abspath(row["image_path"]):
-            shutil.move(dest_path, row["image_path"])
+        if os.path.abspath(dest_path) != os.path.abspath(src_path):
+            shutil.move(dest_path, src_path)
         raise HTTPException(status_code=409, detail=str(e))
     return {"ok": True}
 
@@ -261,15 +276,18 @@ def unlabel(req: UnlabelRequest):
     if row["label_status"] not in ("labeled", "skipped"):
         raise HTTPException(status_code=409, detail=f"Capture is {row['label_status']} — nothing to undo")
 
-    if row["label_status"] == "labeled" and os.path.exists(row["image_path"]):
-        dest_path = os.path.join(TRAINING_UNLABELED_DIR, os.path.basename(row["image_path"]))
-        if os.path.abspath(row["image_path"]) != os.path.abspath(dest_path):
-            shutil.move(row["image_path"], dest_path)
+    src_path = _image_path(row)
+    if row["label_status"] == "labeled" and src_path is not None:
+        os.makedirs(TRAINING_UNLABELED_DIR, exist_ok=True)
+        dest_path = os.path.join(TRAINING_UNLABELED_DIR, os.path.basename(src_path))
+        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+            shutil.move(src_path, dest_path)
+        stored = storage.to_stored(dest_path)
     else:
-        dest_path = row["image_path"]  # skipped captures were never moved
+        stored = row["image_path"]  # skipped captures were never moved
 
     try:
-        face_db.unlabel_training_capture(req.capture_id, dest_path)
+        face_db.unlabel_training_capture(req.capture_id, stored)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {"ok": True}
@@ -289,7 +307,9 @@ def employees():
 
 @router.post("/employees")
 def add_employee(req: EmployeeIn):
-    face_db.upsert_employee(req.employee_id, req.name)
+    if not req.name.strip():
+        raise HTTPException(status_code=422, detail="Name is required")
+    face_db.upsert_employee(_checked_employee_id(req.employee_id), req.name.strip())
     return {"ok": True}
 
 
@@ -314,18 +334,23 @@ def sync_employees():
     fix at the source, so the correction has to be reapplied here on every
     sync rather than getting silently overwritten again.
     """
-    try:
-        with urllib.request.urlopen(EXTERNAL_FACES_API, timeout=10) as resp:
-            rows = json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach external faces API: {e}")
+    from app.face_routes import fetch_identity_roster
+
+    rows = fetch_identity_roster()
 
     imported = 0
     skipped_no_id = 0
     current_ids = set()
     for r in rows:
+        if not isinstance(r, dict):
+            continue
         employee_id = r.get("employee_id")
         if not employee_id:
+            skipped_no_id += 1
+            continue
+        try:
+            employee_id = uploads.validate_identifier(str(employee_id), "employee_id")
+        except uploads.UploadError:
             skipped_no_id += 1
             continue
         corrected = employee_directory.get_employee(employee_id)

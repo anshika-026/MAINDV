@@ -1,23 +1,45 @@
-# Runtime application data — the live SQLite database, camera capture/
-# training images, and biometric embeddings this app generates while
-# running. Never source code, always machine-specific and constantly
-# changing; must never be committed. (Note: backend/data is actually a
-# symlink to C:\DecoVisionData on this machine — these patterns are
-# written as the repo-relative paths git itself reports, which resolve
-# through that symlink correctly.)
-backend/data/app.db
-backend/data/face_training/
-backend/data/face_captures/
-backend/data/face_pending/
-backend/data/face_training_captures/
+# ---------------------------------------------------------------------------
+# Runtime application data — NEVER commit. This is the live SQLite database,
+# face captures, enrollment photos, training images, Re-ID and alert
+# snapshots, and the trained classifier: biometric data of real people.
+# It is machine-specific and constantly changing. Back it up with the
+# procedure in DEPLOYMENT.md, not with git. See GIT_DATA_CLEANUP.md.
+# ---------------------------------------------------------------------------
+backend/data/
+backend/data_backup*/
+backend/data-*/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.joblib
+*.joblib.bak-*
+*.bak-*
 
-# Local secrets/config — real per-machine values (camera hosts, ports,
-# CORS origins), never meant to be shared via git. .env.example stays
-# tracked as the template.
-backend/.env
-frontend/.env
+# Logs written by the backend (LOG_DIR).
+backend/logs/
+*.log
+
+# Local secrets/config — real per-machine values (camera hosts, secrets,
+# admin bootstrap password). The *.example templates stay tracked.
+.env
+.env.*
+!.env.example
+!frontend/.env.production
 *.pem
 *.key
+*.p12
+*.pfx
+
+# Model weights are provisioned per deployment (scripts/fetch_models.py,
+# DEPLOYMENT.md), not versioned in git.
+backend/models/*
+!backend/models/README.md
+!backend/models/emotion_model_v3.keras
+*.pt
+*.pth
+*.onnx
 
 # Python
 __pycache__/
@@ -26,13 +48,19 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .venv/
-.venv-1/
+.venv-*/
 venv/
 
 # Node/frontend build output
 node_modules/
 dist/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
 
 # Claude Code session/tooling state — not application source code.
 .claude/

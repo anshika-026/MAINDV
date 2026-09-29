@@ -18,18 +18,23 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 
-from fastapi import Depends, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 import cv2
 
-from . import auth, camera_db, camera_stream, config, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db
-from .staff import routes as staff_routes
-from .staff.service import service as staff_service
-from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes
+from . import config, logging_setup
 
-logging.basicConfig(level=logging.INFO)
+logging_setup.configure()
+
+from . import audit, auth, camera_db, camera_stream, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db, ratelimit  # noqa: E402
+from .staff import routes as staff_routes  # noqa: E402
+from .staff.service import service as staff_service  # noqa: E402
+from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes  # noqa: E402
+
+log = logging.getLogger("main")
 
 # Same oversubscription fix as the OMP/BLAS env vars above, for OpenCV's
 # own internal parallelism (JPEG decode/encode, resize) — otherwise each of
@@ -42,15 +47,51 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="Deco Vision API")
+app = FastAPI(
+    title="Deco Vision API",
+    docs_url="/docs" if config.ENABLE_API_DOCS else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if config.ENABLE_API_DOCS else None,
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# Largest body any endpoint legitimately takes: one image upload plus
+# multipart overhead. Checked against Content-Length before the body is
+# read, so an oversized upload is refused without being buffered.
+_MAX_BODY_BYTES = config.MAX_UPLOAD_BYTES + 256 * 1024
+
+
+@app.middleware("http")
+async def _limits_and_headers(request: Request, call_next):
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            too_big = int(length) > _MAX_BODY_BYTES
+        except ValueError:
+            return JSONResponse({"detail": "Invalid Content-Length"}, status_code=400)
+        if too_big:
+            return JSONResponse({"detail": "Request body too large"}, status_code=413)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    # Full traceback to the log, nothing internal to the caller.
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse({"detail": "Internal server error"}, status_code=500)
 
 app.include_router(face_routes.router)
 app.include_router(face_training_routes.router)
@@ -63,7 +104,7 @@ app.include_router(alerts_routes.router)
 app.include_router(analytics_routes.router)
 app.include_router(intrusion_routes.router)
 app.include_router(staff_routes.router)
-staff_routes.register_websockets(app, lambda token: auth.get_session(token) is not None)
+staff_routes.register_websockets(app)
 
 
 def _enable_wal() -> None:
@@ -83,18 +124,38 @@ def _enable_wal() -> None:
         conn.close()
 
 
-@app.on_event("startup")
-def on_startup():
+def check_configuration() -> None:
+    """Fatal in production, warnings elsewhere — see config.validate()."""
+    problems = config.validate()
+    for p in problems:
+        (log.error if config.IS_PRODUCTION else log.warning)("configuration: %s", p)
+    if problems and config.IS_PRODUCTION:
+        raise RuntimeError("Refusing to start with an unsafe production configuration: " + "; ".join(problems))
+    if config.JWT_SECRET_IS_EPHEMERAL:
+        log.warning("configuration: JWT_SECRET not set; license QR codes will stop verifying after a restart")
+
+
+def init_databases() -> None:
     _enable_wal()
     camera_db.init_db()
     analytics_settings.init_db()
     face_db.init_face_tables()
     license_db.init_db()
     auth.init_db()
+    audit.init_db()
+    auth.bootstrap_admin_from_env()
+    if auth.count_admin_users() == 0:
+        msg = "no admin account exists; create one with: python -m app.manage create-admin --email you@example.com"
+        if config.IS_PRODUCTION:
+            raise RuntimeError(msg)
+        log.warning(msg)
     attendance.init_db()
     alerts.init_db()
     intrusion.init_db()
     desk_db.init_db()
+
+
+def start_services() -> None:
     # Always start the expiry watcher (cheap, idempotent) so a session
     # started later still gets watched, then resume whatever collection
     # session was running before a restart (if its planned end time hasn't
@@ -117,6 +178,13 @@ def on_startup():
     intrusion.service.start()
     # Staff Count at entrance cameras (see app/staff/).
     staff_service.start()
+
+
+@app.on_event("startup")
+def on_startup():
+    check_configuration()
+    init_databases()
+    start_services()
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +238,9 @@ def list_cameras(principal: dict = Depends(auth.get_principal)):
 
 
 @app.post("/api/cameras")
-def create_camera(payload: CameraIn, _: dict = Depends(auth.require_admin)):
+def create_camera(payload: CameraIn, principal: dict = Depends(auth.require_admin)):
     camera_id = camera_db.add_camera(payload.name, payload.site, **payload.model_dump(exclude={"name", "site"}))
+    audit.record("camera.create", principal, target=f"camera:{camera_id}", name=payload.name)
     return camera_db.get_camera(camera_id)
 
 
@@ -201,26 +270,32 @@ def test_camera_stream(payload: StreamTestIn, _: dict = Depends(auth.require_adm
 
 
 @app.put("/api/cameras/{camera_id}")
-def update_camera(camera_id: int, payload: CameraUpdate, _: dict = Depends(auth.require_admin)):
+def update_camera(camera_id: int, payload: CameraUpdate, principal: dict = Depends(auth.require_admin)):
     if camera_db.get_camera(camera_id) is None:
         raise HTTPException(status_code=404, detail="Camera not found")
     fields = payload.model_dump(exclude_unset=True)
     camera_db.update_camera(camera_id, **fields)
+    audit.record("camera.update", principal, target=f"camera:{camera_id}",
+                 fields=sorted(k for k in fields if k != "password"), password_changed="password" in fields)
     if "live_feed_enabled" in fields:
         stream = camera_stream.get_stream(camera_id)
         stream.resume() if fields["live_feed_enabled"] else stream.stop()
-        # Background keep-alives (footfall, desks, intrusion) pick it up now, not in 15 s.
-        for sync in (footfall.service._sync_gates, desks.service._sync, intrusion.service.sync, staff_service.sync):
+        # Background keep-alives (footfall, desks, intrusion) pick it up now,
+        # not in 15 s. Each is independent; one failing is logged and the
+        # others still run (it will also catch up on its own periodic sync).
+        for name, sync in (("footfall", footfall.service._sync_gates), ("desks", desks.service._sync),
+                           ("intrusion", intrusion.service.sync), ("staff", staff_service.sync)):
             try:
                 sync()
             except Exception:
-                pass
+                log.exception("camera %s: %s resync after feed change failed", camera_id, name)
     return camera_db.get_camera(camera_id)
 
 
 @app.delete("/api/cameras/{camera_id}")
-def delete_camera(camera_id: int, _: dict = Depends(auth.require_admin)):
+def delete_camera(camera_id: int, principal: dict = Depends(auth.require_admin)):
     camera_db.delete_camera(camera_id)
+    audit.record("camera.delete", principal, target=f"camera:{camera_id}")
     return {"ok": True}
 
 
@@ -239,13 +314,20 @@ class SiteUpdate(BaseModel):
 
 
 @app.get("/api/sites")
-def list_sites(_: dict = Depends(auth.get_principal)):
-    # Sites aren't part of the per-license assignment model (unlike
-    # cameras) — any authenticated principal can list them, but only an
-    # admin can create/edit/delete one (below). No per-tenant filtering
-    # exists here because a "site" isn't owned by a client in this app's
-    # data model, only its cameras are.
-    return camera_db.list_sites()
+def list_sites(principal: dict = Depends(auth.get_principal)):
+    # Sites aren't owned by a client, but each site lists its cameras, so a
+    # client only sees their own licensed cameras inside it (and only the
+    # sites that contain one) — never another tenant's camera names.
+    sites = camera_db.list_sites()
+    allowed = auth.allowed_camera_ids(principal)
+    if allowed is None:
+        return sites
+    scoped = []
+    for s in sites:
+        cams = [c for c in s.get("cameras", []) if c.get("id") in allowed]
+        if cams:
+            scoped.append({**s, "cameras": cams, "active_count": sum(1 for c in cams if c.get("status") == "active")})
+    return scoped
 
 
 @app.post("/api/sites")
@@ -273,8 +355,15 @@ def delete_site(site_id: int, _: dict = Depends(auth.require_admin)):
 _settings = {"detection_fps": 1.0}
 
 
+class SettingsIn(BaseModel):
+    # Only known keys, each bounded: this used to accept (and store) any
+    # JSON object from anyone, unauthenticated.
+    model_config = ConfigDict(extra="forbid")
+    detection_fps: float = Field(ge=0.1, le=30)
+
+
 @app.get("/api/stats")
-def get_stats():
+def get_stats(_: dict = Depends(auth.require_admin)):
     cameras = camera_db.list_cameras()
     return {
         "total_cameras": len(cameras),
@@ -285,50 +374,60 @@ def get_stats():
     }
 
 
-@app.get("/api/alerts")
-def list_alerts(resolved: bool | None = None):
-    return []
-
-
-@app.post("/api/alerts/{alert_id}/resolve")
-def resolve_alert(alert_id: int):
-    return {"ok": True}
-
-
 @app.get("/api/settings")
-def get_settings():
+def get_settings(_: dict = Depends(auth.require_admin)):
     return _settings
 
 
 @app.put("/api/settings")
-def update_settings(payload: dict):
-    _settings.update(payload)
+def update_settings(payload: SettingsIn, principal: dict = Depends(auth.require_admin)):
+    changes = payload.model_dump()
+    _settings.update(changes)
+    audit.record("settings.update", principal, target="settings", **changes)
     return _settings
 
 
 class LoginIn(BaseModel):
-    email: str
+    email: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginIn):
-    """LIMITATION, called out explicitly rather than left silent: this
-    still does not check a password — it never has (see
-    BACKEND_HANDOFF.md). Submitting any email logs in as an admin. What
-    changed here is that a real, server-side session token is now issued
-    and required on every subsequent admin-only request (auth.py) —
-    previously NO token was checked at all, so this is a real
-    improvement (no token -> no access), just not a substitute for actual
-    admin authentication, which would need a real user/password table.
-    That's a separate, larger piece of work than this change covers."""
-    token = auth.create_admin_session(payload.email)
-    return {"email": payload.email, "name": payload.email.split("@")[0], "token": token}
+def login(payload: LoginIn, request: Request):
+    """Admin login: email + password checked against admin_users
+    (auth.authenticate_admin). Failures are throttled per IP and per email
+    (ratelimit.py) and always get the same generic message, whether the
+    email exists or not."""
+    ip = ratelimit.client_ip(request)
+    guard = ratelimit.admin_login_guard
+    guard.check(ip, payload.email)
+    admin = auth.authenticate_admin(payload.email, payload.password)
+    if admin is None:
+        guard.failed(ip, payload.email)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    guard.succeeded(ip, payload.email)
+    token = auth.create_admin_session(admin)
+    audit.record("admin.login", {"email": admin["email"]}, ip=ip)
+    return {"email": admin["email"], "name": admin["name"], "token": token}
+
+
+@app.get("/api/auth/me")
+def me(principal: dict = Depends(auth.require_admin)):
+    admin = auth.get_admin_user(principal["admin_user_id"])
+    if admin is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"email": admin["email"], "name": admin["name"]}
 
 
 @app.post("/api/auth/logout")
 def logout(principal: dict = Depends(auth.get_principal)):
     auth.revoke_session(principal["token"])
     return {"ok": True}
+
+
+@app.get("/api/audit")
+def audit_log(limit: int = 200, _: dict = Depends(auth.require_admin)):
+    return audit.recent(limit)
 
 
 # ---------------------------------------------------------------------------
@@ -347,16 +446,7 @@ def _authorize_camera_ws(token: str | None, camera_id: int) -> bool:
     client whose license is no longer active, or a client whose license
     doesn't include this specific camera. An admin session may access any
     camera, matching the HTTP camera endpoints' behavior."""
-    session = auth.get_session(token) if token else None
-    if session is None:
-        return False
-    if session["principal_type"] == auth.ADMIN:
-        return True
-    try:
-        lic = auth.load_active_client_license(session)
-    except HTTPException:
-        return False
-    return license_db.is_camera_assigned(lic["id"], camera_id)
+    return auth.can_access_camera(auth.get_session(token), camera_id)
 
 
 @app.websocket("/ws/live/{camera_id}")

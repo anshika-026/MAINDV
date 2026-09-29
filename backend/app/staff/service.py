@@ -234,8 +234,8 @@ class StaffService:
 
     # ---- reporting ----------------------------------------------------------------
 
-    def count(self) -> dict:
-        return self.manager.counts(anonymous_mode=self.anonymous_mode()) if self.manager else {}
+    def count(self, camera_ids: set[int] | None = None) -> dict:
+        return self.manager.counts(anonymous_mode=self.anonymous_mode(), camera_ids=camera_ids) if self.manager else {}
 
     def debug(self, camera_id: int) -> dict:
         from app import employee_directory

@@ -29,6 +29,31 @@ function StatusPill({ status }) {
   return <span className={`badge ${STATUS_TONE[status] || "badge-neutral"}`}>{status}</span>;
 }
 
+// The QR endpoint needs the admin Bearer token, which a plain <img src>
+// can't send — fetch it and show an object URL instead.
+function LicenseQrImage({ licenseId }) {
+  const [url, setUrl] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let objectUrl = null;
+    let cancelled = false;
+    api
+      .fetchLicenseQrObjectUrl(licenseId)
+      .then((u) => {
+        objectUrl = u;
+        if (!cancelled) setUrl(u);
+      })
+      .catch((e) => !cancelled && setError(e.message));
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [licenseId]);
+  if (error) return <p className="text-sm text-danger-500">{error}</p>;
+  if (!url) return <div className="mx-auto w-48 h-48 bg-slate-100 animate-pulse rounded" />;
+  return <img src={url} alt="License QR code" className="mx-auto w-48 h-48" />;
+}
+
 export default function LicenseManagement() {
   const [companies, setCompanies] = useState([]);
   const [licenses, setLicenses] = useState([]);
@@ -618,7 +643,7 @@ export default function LicenseManagement() {
       <Modal open={!!qrFor} onClose={() => setQrFor(null)} title="License QR Code" width="max-w-sm">
         {qrFor && (
           <div className="space-y-4 text-center">
-            <img src={api.licenseQrUrl(qrFor.id)} alt="License QR code" className="mx-auto w-48 h-48" />
+            <LicenseQrImage licenseId={qrFor.id} />
             <p className="font-mono text-sm text-ink-900">{qrFor.license_key}</p>
             <p className="text-xs text-slate-400">Right-click the image to save or print it.</p>
           </div>

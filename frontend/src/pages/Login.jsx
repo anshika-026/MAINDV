@@ -19,8 +19,8 @@ export default function Login() {
     try {
       await login(email, password);
       navigate("/dashboard");
-    } catch {
-      setError("Couldn't log in. Check your email and password and try again.");
+    } catch (err) {
+      setError(err?.message || "Couldn't log in. Check your email and password and try again.");
     } finally {
       setLoading(false);
     }
@@ -46,9 +46,7 @@ export default function Login() {
         <div>
           <div className="flex items-center justify-between mb-1.5">
             <label className="text-sm font-medium text-ink-900">Password</label>
-            <Link to="/forgot-password" className="text-xs text-brand-600 font-medium">
-              Forgot password?
-            </Link>
+            <span className="text-xs text-slate-500">Forgot it? Ask your administrator.</span>
           </div>
           <PasswordField
             required
@@ -66,12 +64,6 @@ export default function Login() {
       </form>
 
       <p className="text-sm text-slate-500 text-center mt-6">
-        Don't have an account?{" "}
-        <Link to="/signup" className="text-brand-600 font-medium">
-          Create your account
-        </Link>
-      </p>
-      <p className="text-sm text-slate-500 text-center mt-2">
         Client portal login?{" "}
         <Link to="/client-login" className="text-brand-600 font-medium">
           Log in here

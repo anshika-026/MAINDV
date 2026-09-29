@@ -266,14 +266,20 @@ class StaffOccupancyManager:
 
     # ---- reporting --------------------------------------------------------------
 
-    def counts(self, anonymous_mode: bool = False, now=None) -> dict:
+    def counts(self, anonymous_mode: bool = False, now=None, camera_ids: set[int] | None = None) -> dict:
+        """camera_ids: restrict to visits/events seen on these cameras (a
+        client's licensed cameras); None = everything (admin)."""
         now = now if now is not None else time.time()
         start = _day_start(now)
         with self._lock:
-            known = sum(1 for v in self._present.values() if v.get("employee_id"))
-            unknown = len(self._present) - known
+            present = [v for v in self._present.values() if camera_ids is None or v.get("camera_id") in camera_ids]
+            known = sum(1 for v in present if v.get("employee_id"))
+            unknown = len(present) - known
+        q, p = "SELECT event_type, COUNT(*) FROM staff_events WHERE ts >= ?", [start]
+        if camera_ids is not None:
+            q, p = q + f" AND camera_id IN ({','.join('?' * len(camera_ids)) or 'NULL'})", p + sorted(camera_ids)
         with _conn() as conn:
-            by_type = dict(conn.execute("SELECT event_type, COUNT(*) FROM staff_events WHERE ts >= ? GROUP BY event_type", (start,)).fetchall())
+            by_type = dict(conn.execute(q + " GROUP BY event_type", p).fetchall())
         return {
             # Face recognition off: nobody can be told apart from a visitor, so
             # everyone inside is counted as staff (but never named).
@@ -301,11 +307,14 @@ class StaffOccupancyManager:
             latest[r["employee_id"]] = {k: r[k] for k in ("employee_id", "status", "entry_time", "exit_time", "last_seen", "camera_id", "confidence")}
         return sorted(latest.values(), key=lambda r: (r["status"] != PRESENT, -r["last_seen"]))
 
-    def events(self, event_type: str | None = None, limit: int = 200, since: float | None = None) -> list[dict]:
+    def events(self, event_type: str | None = None, limit: int = 200, since: float | None = None,
+               camera_ids: set[int] | None = None) -> list[dict]:
         q, p = "SELECT * FROM staff_events WHERE 1=1", []
         if event_type:
             q, p = q + " AND event_type = ?", p + [event_type]
         if since is not None:
             q, p = q + " AND ts >= ?", p + [since]
+        if camera_ids is not None:
+            q, p = q + f" AND camera_id IN ({','.join('?' * len(camera_ids)) or 'NULL'})", p + sorted(camera_ids)
         with _conn() as conn:
             return [dict(r) for r in conn.execute(q + " ORDER BY ts DESC LIMIT ?", (*p, limit))]

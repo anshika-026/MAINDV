@@ -42,8 +42,11 @@ function placeholderPhotos(prefix, count) {
 export default function People() {
   const [tab, setTab] = useState("Employee");
   const [employees, setEmployees] = useState([]);
+  // Sample guests only in an explicit demo build (no guest backend exists yet).
   const [guests, setGuests] = useState(
-    incomingGuests.map((g, i) => ({ ...g, type: "Guest", photos: placeholderPhotos(`guest-${i}`, g.designs) }))
+    api.DEMO_MODE
+      ? incomingGuests.map((g, i) => ({ ...g, type: "Guest", photos: placeholderPhotos(`guest-${i}`, g.designs) }))
+      : []
   );
   const [validated, setValidated] = useState([]);
   const [search, setSearch] = useState("");
@@ -76,13 +79,18 @@ export default function People() {
   const [galleryPreview, setGalleryPreview] = useState(null);
 
   useEffect(() => {
-    api.getPeople().then((rows) =>
+    api
+      .getPeople()
+      .catch((e) => {
+        setToast(`Couldn't load people: ${e.message}`);
+        return [];
+      })
+      .then((rows) =>
       setEmployees(
         rows.map((r, i) => {
-          // employeeMeta only supplies demo defaults (zone/camera/...) for the
-          // mock fallback rows — real API fields (employeeId, photos, designs,
-          // enrollment) always win when present.
-          const merged = { ...(employeeMeta[i] || {}), ...r, type: "Employee" };
+          // employeeMeta is sample zone/camera/confidence data — only merged
+          // in an explicit demo build, never onto real people.
+          const merged = { ...(api.DEMO_MODE ? employeeMeta[i] || {} : {}), ...r, type: "Employee" };
           return {
             ...merged,
             photos: merged.photos && merged.photos.length ? merged.photos : placeholderPhotos(`emp-${i}`, merged.designs),
@@ -147,7 +155,7 @@ export default function People() {
     const rows = await api.getPeople();
     setEmployees(
       rows.map((r, i) => {
-        const merged = { ...(employeeMeta[i] || {}), ...r, type: r.type || "Employee" };
+        const merged = { ...(api.DEMO_MODE ? employeeMeta[i] || {} : {}), ...r, type: r.type || "Employee" };
         return {
           ...merged,
           photos: merged.photos && merged.photos.length ? merged.photos : placeholderPhotos(`emp-${i}`, merged.designs),

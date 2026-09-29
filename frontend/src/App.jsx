@@ -6,7 +6,6 @@ import AppShell from "./layouts/AppShell";
 
 import Login from "./pages/Login";
 import ClientLogin from "./pages/ClientLogin";
-import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import LiveFeed from "./pages/LiveFeed";
 import PlainLiveFeed from "./pages/PlainLiveFeed";
@@ -40,7 +39,8 @@ export default function App() {
               backend/app/license_routes.py's public_company_by_slug and
               the report's production-deployment notes for real subdomains. */}
           <Route path="/client/:slug/login" element={<ClientLogin />} />
-          <Route path="/signup" element={<Signup />} />
+          {/* No self-signup: admin accounts are created by an operator
+              (python -m app.manage create-admin), clients by an admin. */}
           <Route
             path="/face-training"
             element={
