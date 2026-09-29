@@ -79,14 +79,23 @@ class _ExpressionService:
         self._model = None
         self._processor = None
         self._torch = None
-        self._load_failed = False
+        # A failed load (missing package, model not in the offline cache,
+        # bad checkpoint) is retried on a backoff instead of switching
+        # expression off until restart; everything else keeps working.
+        from app import resilience
+
+        self._load_health = resilience.health_for("expression_model")
+
+    @property
+    def _load_failed(self) -> bool:
+        return self._load_health.failed
 
     # -- model ------------------------------------------------------------
 
     def _ensure_loaded(self) -> bool:
         if self._model is not None:
             return True
-        if self._load_failed or not EXPRESSION_ENABLED:
+        if not EXPRESSION_ENABLED or not self._load_health.allow():
             return False
         try:
             import torch
@@ -106,13 +115,10 @@ class _ExpressionService:
             model.eval()
             self._torch, self._processor, self._model = torch, processor, model
             log.info("expression model loaded: %s", EMOTION_MODEL_NAME)
+            self._load_health.success()
             return True
-        except Exception:
-            # Missing dependency, no network on first fetch, bad checkpoint —
-            # all the same outcome: this feature stays off and everything
-            # else keeps working.
-            self._load_failed = True
-            log.exception("expression model unavailable — continuing without expression")
+        except Exception as e:
+            self._load_health.failure(e)
             return False
 
     # -- inference --------------------------------------------------------
@@ -121,7 +127,7 @@ class _ExpressionService:
         """Fire-and-forget. Returns immediately; drops this crop if the
         previous inference is still running, so the caller's thread (the
         face pipeline) is never made to wait on the expression model."""
-        if not EXPRESSION_ENABLED or self._load_failed:
+        if not EXPRESSION_ENABLED or (self._model is None and not self._load_health.allow()):
             return
         if self._future is not None and not self._future.done():
             return  # still busy — skip, never queue up behind it

@@ -41,6 +41,7 @@ import time
 
 from . import camera_db, camera_stream, face_db
 from .face_pipeline import DEFAULT_COLLECTION_DAYS, SESSION_CHECK_INTERVAL_SECONDS, TRAINING_CAPTURE_DIR
+from app import lifecycle
 
 log = logging.getLogger("face_collection")
 
@@ -179,7 +180,8 @@ _expiry_thread_lock = threading.Lock()
 
 def _expiry_loop() -> None:
     while True:
-        time.sleep(SESSION_CHECK_INTERVAL_SECONDS)
+        if lifecycle.wait(SESSION_CHECK_INTERVAL_SECONDS):
+            return
         try:
             session = face_db.get_running_collection_session()
             if session and time.time() >= session["planned_end_at"]:

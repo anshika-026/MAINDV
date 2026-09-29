@@ -38,9 +38,10 @@ import numpy as np
 import torchvision.transforms  # noqa: E402,F401
 from torchreid.reid.utils import FeatureExtractor  # noqa: E402,F401
 
-from . import analytics_settings, camera_db, camera_stream
+from . import analytics_settings, camera_db, camera_stream, resilience
 from .reid import config as reid_config
 from .reid import peopleid_gallery, reid_db, reid_worker
+from app import lifecycle  # noqa: E402
 
 log = logging.getLogger("footfall")
 
@@ -112,13 +113,14 @@ class _GateRunner:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"footfall-{camera_id}")
         self.future: concurrent.futures.Future | None = None
         self.last_submit = 0.0
-        self.failed = False
 
 
 class FootfallService:
     def __init__(self):
         self._gallery: _SharedGallery | None = None
         self._runners: dict[int, _GateRunner] = {}
+        # Per-gate failure tracking that outlives a rebuilt runner (see _process).
+        self._health: dict[int, resilience.FeatureHealth] = {}
         self._sinks: dict[int, _KeepAliveSink] = {}
         self._lock = threading.Lock()
         # Serializes every reid_db write + gallery rebuild across gates, so
@@ -152,8 +154,8 @@ class FootfallService:
                 self._sync_gates()
             except Exception:
                 log.exception("footfall: gate sync failed")
-            time.sleep(GATE_SYNC_INTERVAL_SECONDS)
-
+            if lifecycle.wait(GATE_SYNC_INTERVAL_SECONDS):
+                return
     def _sync_gates(self) -> None:
         # Switched off: stop keeping gates streaming too, so they cost nothing.
         gate_ids = {c["id"] for c in camera_db.list_cameras() if is_gate(c) and camera_db.is_streamable(c)} if analytics_settings.enabled("footfall") else set()
@@ -178,17 +180,22 @@ class FootfallService:
         """Frames per second footfall wants from this camera (0 = none)."""
         if self._gallery is None or camera_id not in self._sinks or not analytics_settings.enabled("footfall"):
             return 0.0
-        runner = self._runners.get(camera_id)
-        if runner is not None and runner.failed:
+        if not self.health(camera_id).allow():
             return 0.0
         return 1.0 / reid_config.REID_MOT_INTERVAL_SECONDS
+
+    def health(self, camera_id: int) -> resilience.FeatureHealth:
+        h = self._health.get(camera_id)
+        if h is None:
+            h = self._health.setdefault(camera_id, resilience.health_for("footfall", camera_id))
+        return h
 
     def deliver(self, camera_id: int, frame: np.ndarray, people: list[dict], ts: float) -> None:
         runner = self._runners.get(camera_id)
         if runner is None:
             with self._lock:
                 runner = self._runners.setdefault(camera_id, _GateRunner(camera_id, self._gallery, self._generation))
-        if runner.failed or (runner.future is not None and not runner.future.done()):
+        if runner.future is not None and not runner.future.done():
             return  # previous look still being processed: skip this one
         runner.future = runner.executor.submit(self._process, runner, frame, people, ts)
 
@@ -198,12 +205,18 @@ class FootfallService:
             result = reid_worker.process_frame(runner.camera_id, frame, runner.state, people=people, now=ts)
             if result:
                 self._record(runner.camera_id, result, runner.generation)
-        except Exception:
-            # Most likely a model that failed to load. Log once and stop
-            # counting on this gate rather than retrying every second; the
-            # live video is unaffected either way.
-            log.exception("footfall: Re-ID failed on camera %s, disabling footfall for it", runner.camera_id)
-            runner.failed = True
+        except Exception as e:
+            # Most likely a model that failed to load, or a transient DB
+            # error. Paused on a backoff (never permanently); after repeated
+            # failures the gate's runner is rebuilt (fresh tracker, models
+            # reloaded). The live video is unaffected either way.
+            if self.health(runner.camera_id).failure(e):
+                with self._lock:
+                    if self._runners.get(runner.camera_id) is runner:
+                        self._runners.pop(runner.camera_id, None)
+                runner.executor.shutdown(wait=False)
+        else:
+            self.health(runner.camera_id).success()
 
     # --- turning track results into durable events ------------------------
 
@@ -386,7 +399,8 @@ class FootfallService:
                 "camera_id": g["id"],
                 "name": g["name"],
                 "unique_today": per_gate.get(g["id"], 0),
-                "counting": g["id"] in self._sinks and not getattr(self._runners.get(g["id"]), "failed", False),
+                "counting": g["id"] in self._sinks and not (g["id"] in self._health and self._health[g["id"]].failed),
+                "state": self._health[g["id"]].state if g["id"] in self._health else "RUNNING",
                 "zone": self.get_zone(g["id"]),
             }
             for g in gates

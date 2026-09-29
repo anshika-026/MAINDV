@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import logging
 import os
+import time
 
 # Must be set before numpy/torch/onnxruntime get imported (transitively, by
 # face_pipeline below) to take effect. Each of the 3 concurrent camera
@@ -25,14 +27,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import cv2
 
-from . import config, logging_setup
+from . import config, logging_setup, models
 
 logging_setup.configure()
+# Before any ML library is imported below: no runtime model downloads in
+# offline mode (see models.py).
+models.apply_offline_environment()
 
 from . import audit, auth, camera_db, camera_stream, employee_directory, face_collection, face_db, face_pipeline, face_training_scheduler, license_db, ratelimit  # noqa: E402
 from .staff import routes as staff_routes  # noqa: E402
 from .staff.service import service as staff_service  # noqa: E402
 from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes  # noqa: E402
+from . import health_routes, lifecycle, person_detection  # noqa: E402
 
 log = logging.getLogger("main")
 
@@ -47,7 +53,22 @@ try:
 except ImportError:
     pass
 
+@contextlib.asynccontextmanager
+async def lifespan(_app):
+    # Startup is synchronous and ordered: refuse an unsafe production
+    # configuration, create/migrate tables, then start background services.
+    check_configuration()
+    init_databases()
+    start_services()
+    log.info("startup complete (APP_ENV=%s)", config.APP_ENV)
+    try:
+        yield
+    finally:
+        shutdown()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Deco Vision API",
     docs_url="/docs" if config.ENABLE_API_DOCS else None,
     redoc_url=None,
@@ -104,6 +125,7 @@ app.include_router(alerts_routes.router)
 app.include_router(analytics_routes.router)
 app.include_router(intrusion_routes.router)
 app.include_router(staff_routes.router)
+app.include_router(health_routes.router)
 staff_routes.register_websockets(app)
 
 
@@ -180,11 +202,22 @@ def start_services() -> None:
     staff_service.start()
 
 
-@app.on_event("startup")
-def on_startup():
-    check_configuration()
-    init_databases()
-    start_services()
+def shutdown() -> None:
+    """SIGTERM/SIGINT (uvicorn runs the lifespan exit): stop taking new
+    work, stop every camera read loop and its RTSP reader child process,
+    stop inference executors and background loops. Nothing is left running
+    and no orphan reader processes survive the backend."""
+    log.info("shutdown: stopping background services")
+    lifecycle.begin_shutdown()
+    try:
+        camera_stream.stop_all(timeout=10)
+    except Exception:
+        log.exception("shutdown: stopping camera streams failed")
+    try:
+        person_detection.service.shutdown()
+    except Exception:
+        log.exception("shutdown: stopping person detection failed")
+    log.info("shutdown complete")
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +468,11 @@ def audit_log(limit: int = 200, _: dict = Depends(auth.require_admin)):
 # out to every connected viewer over its own websocket.
 # ---------------------------------------------------------------------------
 
+# Websockets are long-lived: the session/license is re-validated this often,
+# so a logout, password change or license suspension ends an open live view.
+_WS_REAUTH_SECONDS = 30.0
+
+
 def _authorize_camera_ws(token: str | None, camera_id: int) -> bool:
     """Shared by both camera websockets below. Browsers can't attach an
     Authorization header to a WebSocket handshake, so the frontend passes
@@ -478,10 +516,20 @@ async def ws_live(websocket: WebSocket, camera_id: int, token: str | None = None
     # w: send frames scaled to this width (grid tiles ask for 960 px; see
     # camera_stream's encoding comment for the bandwidth this saves).
     stream.subscribe(ThreadSafePut, is_collector=plain, width=max(320, min(w, 3840)) if w else None)
+    next_auth_check = loop.time() + _WS_REAUTH_SECONDS
     try:
         while True:
-            frame = await queue.get()
-            await websocket.send_bytes(frame)
+            try:
+                frame = await asyncio.wait_for(queue.get(), timeout=_WS_REAUTH_SECONDS)
+            except asyncio.TimeoutError:
+                frame = None  # no video right now; still re-check the session below
+            if loop.time() >= next_auth_check:
+                next_auth_check = loop.time() + _WS_REAUTH_SECONDS
+                if not await asyncio.to_thread(_authorize_camera_ws, token, camera_id):
+                    await websocket.close(code=4401)
+                    return
+            if frame is not None:
+                await websocket.send_bytes(frame)
     except WebSocketDisconnect:
         pass
     finally:
@@ -517,8 +565,15 @@ async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None 
     if not _authorize_camera_ws(token, camera_id):
         await websocket.close(code=4401)
         return
+    loop = asyncio.get_event_loop()
+    next_auth_check = loop.time() + _WS_REAUTH_SECONDS
     try:
         while True:
+            if loop.time() >= next_auth_check:
+                next_auth_check = loop.time() + _WS_REAUTH_SECONDS
+                if not await asyncio.to_thread(_authorize_camera_ws, token, camera_id):
+                    await websocket.close(code=4401)
+                    return
             pipeline = face_pipeline.get_existing_pipeline(camera_id)
             people = []
             if pipeline is not None:
@@ -563,8 +618,17 @@ def _employee_display_name(employee_id: str) -> str:
     """Resolves a classifier's predicted employee_id to a real name from
     the SAME roster face-training validates labels against (face_db's
     employees table) — never invents a name; falls back to the bare ID if
-    that roster doesn't (yet) have an entry for it."""
-    for e in face_db.list_employees():
-        if e["employee_id"] == employee_id:
-            return e["name"]
-    return employee_id
+    that roster doesn't (yet) have an entry for it.
+
+    Cached for 30 s: this runs for every person in every overlay push
+    (~3/s per open viewer), which used to be a full-table query each time."""
+    global _names_cache, _names_cached_at
+    now = time.monotonic()
+    if now - _names_cached_at > 30:
+        _names_cache = {e["employee_id"]: e["name"] for e in face_db.list_employees()}
+        _names_cached_at = now
+    return _names_cache.get(employee_id, employee_id)
+
+
+_names_cache: dict[str, str] = {}
+_names_cached_at = -1e9

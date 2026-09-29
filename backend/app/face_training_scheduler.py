@@ -45,6 +45,7 @@ import psutil
 
 from app import face_db
 from app.face_training import train_classifier
+from app import lifecycle
 
 log = logging.getLogger("face_training_scheduler")
 
@@ -195,7 +196,8 @@ def _check_once() -> None:
 
 def _loop() -> None:
     while True:
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        if lifecycle.wait(CHECK_INTERVAL_SECONDS):
+            return
         try:
             _check_once()
         except Exception:

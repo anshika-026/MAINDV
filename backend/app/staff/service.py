@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 
-from app import analytics_settings, camera_db
+from app import analytics_settings, camera_db, lifecycle, resilience
 from app.staff import config as staff_config
 from app.staff import occupancy
 from app.staff.occupancy import StaffOccupancyManager
@@ -131,7 +131,6 @@ class _Camera:
         self.tracker = StaffCameraTracker(camera_id, manager, cam_cfg["line"], cam_cfg["inside_sign"], cam_cfg["roi"], cfg)
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"staff-{camera_id}")
         self.future = None
-        self.failed = False
         self.last_processed = None
 
 
@@ -141,6 +140,7 @@ class StaffService:
         self.manager: StaffOccupancyManager | None = None
         self.identity = _Identity()
         self._cams: dict[int, _Camera] = {}
+        self._health: dict[int, "resilience.FeatureHealth"] = {}
         self._sinks: dict[int, _KeepAliveSink] = {}
         self._lock = threading.Lock()
         self._started = False
@@ -182,8 +182,8 @@ class StaffService:
                     self.manager.maybe_end_of_day()
             except Exception:
                 log.exception("staff: background pass failed")
-            time.sleep(SYNC_INTERVAL_SECONDS)
-
+            if lifecycle.wait(SYNC_INTERVAL_SECONDS):
+                return
     def sync(self) -> None:
         from app import camera_stream
 
@@ -203,7 +203,9 @@ class StaffService:
     # (person_detection.py), paced at process_fps for entrance cameras.
     def wants(self, camera_id: int) -> float:
         cam = self._cams.get(camera_id)
-        if cam is None or cam.failed or not analytics_settings.enabled("staff_count") or camera_id not in self._sinks:
+        if cam is None or not analytics_settings.enabled("staff_count") or camera_id not in self._sinks:
+            return 0.0
+        if not self.health(camera_id).allow():
             return 0.0
         return float(self.cfg["process_fps"])
 
@@ -228,9 +230,18 @@ class StaffService:
                     if t.employee_id and t.last_seen == ts and t.bbox:
                         appearance.gallery.learn(t.employee_id, frame, t.bbox, ts)
             cam.last_processed = ts
-        except Exception:
-            log.exception("staff: processing failed on camera %s, disabling Staff Count there", cam.camera_id)
-            cam.failed = True
+        except Exception as e:
+            # Paused on a backoff, never permanently; tracker state is kept
+            # (occupancy lives in the DB-backed manager, not the tracker).
+            self.health(cam.camera_id).failure(e)
+        else:
+            self.health(cam.camera_id).success()
+
+    def health(self, camera_id: int):
+        h = self._health.get(camera_id)
+        if h is None:
+            h = self._health.setdefault(camera_id, resilience.health_for("staff_count", camera_id))
+        return h
 
     # ---- reporting ----------------------------------------------------------------
 
@@ -248,7 +259,7 @@ class StaffService:
             t["name"] = emp["name"] if emp else None
         w, h = (cam.tracker.frame_size if cam and cam.tracker.frame_size else (None, None))
         return {
-            "camera_id": camera_id, "configured": bool(cam), "failed": bool(cam and cam.failed),
+            "camera_id": camera_id, "configured": bool(cam), "failed": self.health(camera_id).failed if cam else False,
             "line": cc["line"] if cc else None, "inside_sign": cc["inside_sign"] if cc else 1, "roi": cc["roi"] if cc else None,
             "frame_w": w, "frame_h": h, "tracks": tracks, "count": self.count(),
             "processing": bool(cam and cam.last_processed and time.time() - cam.last_processed < 3),
@@ -258,7 +269,7 @@ class StaffService:
         return {
             "switch_on": analytics_settings.enabled("staff_count"),
             "anonymous_mode": self.anonymous_mode(),
-            "cameras": [{"camera_id": cid, "failed": c.failed,
+            "cameras": [{"camera_id": cid, "failed": self.health(cid).failed, "state": self.health(cid).state,
                          "processing": bool(c.last_processed and time.time() - c.last_processed < 3)} for cid, c in self._cams.items()],
             "settings": self.cfg,
         }

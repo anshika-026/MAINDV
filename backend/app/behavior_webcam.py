@@ -76,7 +76,7 @@ ATTENTION_HISTORY = 15   # frames averaged before calling someone distracted
 
 _model = None
 _model_lock = threading.Lock()
-_load_failed = False
+_load_health = None  # resilience.FeatureHealth, created on first use
 
 # Per-face rolling state, keyed the same way the endpoint keys a face.
 _history: dict[int, dict] = {}
@@ -86,22 +86,27 @@ _history_lock = threading.Lock()
 def _ensure_model():
     """Loads the Keras model once, lazily. A missing model file or missing
     TensorFlow degrades to "no emotion" rather than breaking the page."""
-    global _model, _load_failed
+    global _model, _load_health
     if _model is not None:
         return _model
-    if _load_failed:
-        return None
     with _model_lock:
         if _model is not None:
             return _model
+        if _load_health is None:
+            from app import resilience
+
+            _load_health = resilience.health_for("webcam_emotion_model")
+        # Retried on a backoff rather than given up on for good.
+        if not _load_health.allow():
+            return None
         try:
             import tensorflow as tf
 
             _model = tf.keras.models.load_model(EMOTION_KERAS_MODEL)
             log.info("emotion model loaded: %s", EMOTION_KERAS_MODEL)
-        except Exception:
-            _load_failed = True
-            log.exception("emotion model unavailable — Behavior Analytics will report no emotion")
+            _load_health.success()
+        except Exception as e:
+            _load_health.failure(e)
         return _model
 
 

@@ -73,6 +73,14 @@ class BodyReIdEmbedder:
         import torch
         from torchreid.reid.utils import FeatureExtractor
 
+        from app import config as _app_config, models as _models
+
+        if not model_path and _app_config.MODEL_OFFLINE_MODE:
+            # torchreid would silently download an ImageNet backbone (and
+            # over-count badly with it, see UNIQUE_FOOTFALL.md).
+            raise _models.ModelMissingError(
+                "Re-ID weights not configured (REID_MODEL_PATH / models/osnet_x0_25_msmt17.pth) and "
+                "MODEL_OFFLINE_MODE is on. Provision with: python -m scripts.fetch_models")
         resolved_device = device
         if resolved_device == "auto":
             resolved_device = "cuda" if torch.cuda.is_available() else "cpu"

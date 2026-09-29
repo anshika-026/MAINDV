@@ -19,11 +19,9 @@ only 2 looks — one short of being enrolled.
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from app import config as _app_config  # loads backend/.env (same file, same precedence as the rest of the app)
 
-load_dotenv()
-
-_MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
+_MODELS_DIR = Path(_app_config.MODEL_DIR)
 
 # --- Person detection + tracking (PersonBodyTracker) ---
 PEOPLEID_MOT_MODEL_PATH = os.getenv("PEOPLEID_MOT_MODEL_PATH", str(_MODELS_DIR / "yolov8n.pt"))

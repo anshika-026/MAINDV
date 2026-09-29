@@ -32,8 +32,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app import alerts, analytics_settings, camera_db
+from app import alerts, analytics_settings, camera_db, resilience
 from app.desk_tracker import in_polygon
+from app import lifecycle
 
 log = logging.getLogger("intrusion")
 
@@ -177,7 +178,7 @@ class IntrusionService:
         self._futures: dict[int, concurrent.futures.Future] = {}
         self._last_logged: dict[int, float] = {}
         self._sinks: dict[int, _KeepAliveSink] = {}
-        self._failed: set[int] = set()
+        self._health: dict[int, resilience.FeatureHealth] = {}
         self._started = False
 
     def start(self) -> None:
@@ -200,8 +201,8 @@ class IntrusionService:
                 self.sync()
             except Exception:
                 log.exception("intrusion: keep-alive sync failed")
-            time.sleep(SYNC_INTERVAL_SECONDS)
-
+            if lifecycle.wait(SYNC_INTERVAL_SECONDS):
+                return
     def sync(self) -> None:
         from app import camera_stream
 
@@ -218,7 +219,7 @@ class IntrusionService:
     # about once a second on cameras with a zone inside its active hours.
     def wants(self, camera_id: int) -> float:
         zones = self._zones.get(camera_id)
-        if not zones or camera_id in self._failed or not analytics_settings.enabled("intrusion"):
+        if not zones or not analytics_settings.enabled("intrusion") or not self.health(camera_id).allow():
             return 0.0
         return 1.0 / CYCLE_SECONDS if any(is_active(z) for z in zones) else 0.0
 
@@ -234,7 +235,23 @@ class IntrusionService:
             camera_id, concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"intrusion-{camera_id}"))
         self._futures[camera_id] = ex.submit(self._detect, camera_id, frame, active, ts, boxes)
 
+    def health(self, camera_id: int) -> resilience.FeatureHealth:
+        h = self._health.get(camera_id)
+        if h is None:
+            h = self._health.setdefault(camera_id, resilience.health_for("intrusion", camera_id))
+        return h
+
     def _detect(self, camera_id: int, frame: np.ndarray, zones: list[dict], now: float, boxes: list) -> None:
+        # Runs on an executor: an exception here would otherwise vanish into
+        # the Future unlogged. Logged and retried on a backoff instead.
+        try:
+            self._detect_inner(camera_id, frame, zones, now, boxes)
+        except Exception as e:
+            self.health(camera_id).failure(e)
+        else:
+            self.health(camera_id).success()
+
+    def _detect_inner(self, camera_id: int, frame: np.ndarray, zones: list[dict], now: float, boxes: list) -> None:
         if not boxes:
             return
         h, w = frame.shape[:2]

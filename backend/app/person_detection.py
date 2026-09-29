@@ -36,9 +36,11 @@ from pathlib import Path
 
 import numpy as np
 
+from . import config, resilience
+
 log = logging.getLogger("person_detection")
 
-MODEL_PATH = str(Path(__file__).resolve().parent.parent / "models" / "yolov8n.pt")
+MODEL_PATH = str(Path(config.MODEL_DIR) / "yolov8n.pt")
 # Lowest confidence any consumer uses (footfall's PEOPLEID_MOT_CONFIDENCE);
 # consumers that want stricter filter the delivered people themselves.
 DETECT_CONF = 0.4
@@ -54,8 +56,16 @@ class _Cam:
         self.future = None
         self.last_run = 0.0
         self.last_delivery: dict[str, float] = {}  # consumer -> next due time
-        self.failed = False
+        # Replaces a permanent `failed` flag: a failure pauses detection on a
+        # backoff and the model is reloaded after repeated failures, so a
+        # transient error can't silently stop footfall, Staff Count and
+        # intrusion on this camera for the rest of the process lifetime.
+        self.health = resilience.health_for("person_detection", camera_id)
         self.ms = []  # recent detection times, for status
+
+    @property
+    def failed(self) -> bool:
+        return self.health.failed
 
 
 class SharedPersonDetection:
@@ -86,7 +96,7 @@ class SharedPersonDetection:
         if cam is None:
             with self._lock:
                 cam = self._cams.setdefault(camera_id, _Cam(camera_id))
-        if cam.failed:
+        if not cam.health.allow():
             return
         now = time.time()
         if now - cam.last_run < 1.0 / max(wanted.values()):
@@ -101,15 +111,18 @@ class SharedPersonDetection:
             if cam.model is None:
                 from ultralytics import YOLO
 
-                cam.model = YOLO(MODEL_PATH)
+                from app import models
+
+                cam.model = YOLO(str(models.require("yolo_person")))
             t = time.time()
             res = cam.model.track(frame, persist=True, tracker=TRACKER, classes=[0], conf=DETECT_CONF,
                                   imgsz=IMGSZ, verbose=False)[0]
             cam.ms = (cam.ms + [round((time.time() - t) * 1000)])[-20:]
-        except Exception:
-            log.exception("person detection failed on camera %s, disabling it", cam.camera_id)
-            cam.failed = True
+        except Exception as e:
+            if cam.health.failure(e):
+                cam.model = None  # reload the model (and a fresh tracker) next time
             return
+        cam.health.success()
         people = []
         if res.boxes is not None and len(res.boxes):
             ids = res.boxes.id.cpu().numpy().astype(int) if res.boxes.id is not None else [None] * len(res.boxes)
@@ -136,9 +149,15 @@ class SharedPersonDetection:
             except Exception:
                 log.exception("person consumer %s failed on camera %s", name, cam.camera_id)
 
+    def shutdown(self) -> None:
+        with self._lock:
+            cams = list(self._cams.values())
+        for c in cams:
+            c.executor.shutdown(wait=False, cancel_futures=True)
+
     def status(self) -> list[dict]:
         return [
-            {"camera_id": cid, "failed": c.failed, "wanted": self._wanted(cid),
+            {"camera_id": cid, "failed": c.failed, "state": c.health.state, "wanted": self._wanted(cid),
              "detect_ms": round(sum(c.ms) / len(c.ms)) if c.ms else None,
              "running": time.time() - c.last_run < 3}
             for cid, c in self._cams.items()

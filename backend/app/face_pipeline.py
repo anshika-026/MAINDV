@@ -505,8 +505,13 @@ class CameraFacePipeline:
                 # runs genderage + two dense-landmark models on every face,
                 # none of which anything here reads. Measured: identical
                 # embeddings (cosine >= 0.99999), ~2.6x faster per face.
+                # Explicit root + offline check: InsightFace otherwise downloads
+                # buffalo_l from GitHub on first use (see models.py).
+                from app import config as _config, models as _models
+
+                _models.require("insightface_buffalo_l")
                 cls._arcface = insightface.app.FaceAnalysis(
-                    name="buffalo_l", providers=["CPUExecutionProvider"],
+                    name="buffalo_l", root=str(_config.INSIGHTFACE_ROOT), providers=["CPUExecutionProvider"],
                     allowed_modules=["detection", "recognition"],
                 )
                 cls._arcface.prepare(ctx_id=-1, det_size=(640, 640))
@@ -515,7 +520,9 @@ class CameraFacePipeline:
     def _ensure_yolo_loaded(cls):
         with cls._model_lock:
             if cls._yolo is None:
-                cls._yolo = YOLO(YOLO_FACE_WEIGHTS)
+                from app import models as _models
+
+                cls._yolo = YOLO(str(_models.require("yolo_face")))
 
     @classmethod
     def _ensure_yolo_person_loaded(cls):
@@ -524,7 +531,9 @@ class CameraFacePipeline:
         docstring for why the face model is never reused for this)."""
         with cls._model_lock:
             if cls._yolo_person is None:
-                cls._yolo_person = YOLO(YOLO_PERSON_WEIGHTS)
+                from app import models as _models
+
+                cls._yolo_person = YOLO(str(_models.require("yolo_person")))
 
     @classmethod
     def _ensure_yolo_person_rescue_loaded(cls):
@@ -535,7 +544,9 @@ class CameraFacePipeline:
         the first time it fires."""
         with cls._model_lock:
             if cls._yolo_person_rescue is None:
-                cls._yolo_person_rescue = YOLO(PERSON_RESCUE_WEIGHTS)
+                from app import models as _models
+
+                cls._yolo_person_rescue = YOLO(str(_models.require("yolo_person_rescue")))
 
     @classmethod
     def _ensure_models_loaded(cls):
@@ -1338,6 +1349,16 @@ def get_pipeline(camera_id: int) -> CameraFacePipeline:
         if camera_id not in _pipelines:
             _pipelines[camera_id] = CameraFacePipeline(camera_id)
         return _pipelines[camera_id]
+
+
+def discard_pipeline(camera_id: int) -> None:
+    """Drop one camera's pipeline (tracker/temporal state) so the next frame
+    builds a fresh one — used by camera_stream's recovery after repeated
+    failures. The shared model instances are class-level and untouched, so
+    other cameras are unaffected; any model that failed to load is None and
+    gets loaded again by the new pipeline."""
+    with _pipelines_lock:
+        _pipelines.pop(camera_id, None)
 
 
 def get_existing_pipeline(camera_id: int) -> "CameraFacePipeline | None":

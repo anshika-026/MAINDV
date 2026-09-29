@@ -27,6 +27,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from app import lifecycle
 
 log = logging.getLogger("alerts")
 
@@ -247,9 +248,8 @@ def _monitor_loop() -> None:
                     resolve_open(key, "Counting again")
         except Exception:
             log.exception("alerts: monitor pass failed")
-        time.sleep(MONITOR_INTERVAL_SECONDS)
-
-
+        if lifecycle.wait(MONITOR_INTERVAL_SECONDS):
+            return
 _started = False
 
 

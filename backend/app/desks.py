@@ -24,6 +24,7 @@ import time
 
 from app import analytics_settings, attendance, camera_db
 from app.desk_tracker import DESK_SESSION_GRACE_SECONDS, DeskTracker, in_polygon
+from app import lifecycle
 
 log = logging.getLogger("desks")
 
@@ -71,8 +72,8 @@ class DeskService:
                 self._sync()
             except Exception:
                 log.exception("desks: keep-alive sync failed")
-            time.sleep(SYNC_INTERVAL_SECONDS)
-
+            if lifecycle.wait(SYNC_INTERVAL_SECONDS):
+                return
     def _sync(self) -> None:
         from app import camera_stream  # lazy: camera_stream imports face_pipeline, which imports this module
 
