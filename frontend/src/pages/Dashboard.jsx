@@ -3,6 +3,7 @@ import { AlertTriangle, Sparkles } from "lucide-react";
 import * as api from "../api/client";
 import StatCard from "../components/StatCard";
 import { useAuth } from "../context/AuthContext";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 export default function Dashboard() {
   const { user } = useAuth();
@@ -20,8 +21,8 @@ export default function Dashboard() {
         })
         .catch(() => setError("Couldn't load the dashboard. Check the backend is running on port 8821."));
     load();
-    const t = setInterval(load, 30000);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, 30000);
+    return () => clearVisibleInterval(t);
   }, []);
 
   if (error && !stats) return <p className="text-sm text-danger-500">{error}</p>;

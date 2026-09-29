@@ -9,6 +9,7 @@ import ToggleSwitch from "../components/ToggleSwitch";
 import StatusBadge from "../components/StatusBadge";
 import PolygonZoneEditor from "../components/PolygonZoneEditor";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // Restricted-area (intrusion) zones, drawn on a camera's live picture
 // (backend/app/intrusion.py). Anyone whose feet are inside an active zone
@@ -47,8 +48,8 @@ export default function Intrusion() {
   useEffect(() => {
     load();
     api.getCameras().then(setCameras).catch(() => setCameras([]));
-    const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, REFRESH_MS);
+    return () => clearVisibleInterval(t);
   }, [load]);
 
   const loadZonesFor = useCallback(

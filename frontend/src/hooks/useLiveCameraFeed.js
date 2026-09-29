@@ -98,18 +98,56 @@ export default function useLiveCameraFeed(camera, { overlay = true, width } = {}
     // way it would a header, and closes the connection if it's missing,
     // expired, or doesn't own this camera.
     const token = localStorage.getItem("deco_token") || "";
-    const ws = new WebSocket(
-      `${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}?token=${encodeURIComponent(token)}${overlay ? "" : "&plain=1"}${width ? `&w=${width}` : ""}`
+    const liveUrl = `${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}?token=${encodeURIComponent(token)}${overlay ? "" : "&plain=1"}${width ? `&w=${width}` : ""}`;
+    const detUrl = `${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}?token=${encodeURIComponent(token)}`;
+
+    // A dropped socket (backend restart, network blip, camera reconnect)
+    // reconnects on its own with backoff (1 s doubling to 30 s) instead of
+    // leaving the tile "offline" until a page reload. Not retried when the
+    // server refused access (4401 not authenticated / 4403 feed off) — that
+    // won't fix itself by retrying.
+    let disposed = false;
+    const timers = new Set();
+    function keepConnected(url, setup, onDown) {
+      let delay = 1000;
+      let current = null;
+      const open = () => {
+        if (disposed) return;
+        const sock = new WebSocket(url);
+        current = sock;
+        setup(sock, () => (delay = 1000));
+        sock.onclose = (ev) => {
+          onDown?.();
+          if (disposed || ev.code === 4401 || ev.code === 4403) return;
+          const t = setTimeout(() => {
+            timers.delete(t);
+            open();
+          }, delay);
+          timers.add(t);
+          delay = Math.min(delay * 2, 30000);
+        };
+      };
+      open();
+      return () => current?.close();
+    }
+
+    const closeLive = keepConnected(
+      liveUrl,
+      (sock, resetBackoff) => {
+        sock.binaryType = "blob";
+        sock.onopen = () => {
+          resetBackoff();
+          setStatus("live");
+        };
+        sock.onerror = () => setStatus("offline");
+        sock.onmessage = (event) => {
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+          objectUrl = URL.createObjectURL(event.data);
+          img.src = objectUrl;
+        };
+      },
+      () => setStatus("offline")
     );
-    ws.binaryType = "blob";
-    ws.onopen = () => setStatus("live");
-    ws.onclose = () => setStatus("offline");
-    ws.onerror = () => setStatus("offline");
-    ws.onmessage = (event) => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-      objectUrl = URL.createObjectURL(event.data);
-      img.src = objectUrl;
-    };
     img.onload = () => {
       if (canvas.width !== img.width || canvas.height !== img.height) {
         canvas.width = img.width;
@@ -120,25 +158,27 @@ export default function useLiveCameraFeed(camera, { overlay = true, width } = {}
 
     // Best-effort: if this fails to connect for any reason, the video feed
     // above still works — this only adds the overlay on top of it.
-    const detWs = overlay
-      ? new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}?token=${encodeURIComponent(token)}`)
+    const closeDet = overlay
+      ? keepConnected(detUrl, (sock, resetBackoff) => {
+          sock.onopen = resetBackoff;
+          sock.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              detectionsRef.current = { people: data.people || [], frameW: data.frame_w || null };
+            } catch {
+              // malformed payload — keep showing the last good overlay
+            }
+            redraw();
+          };
+          sock.onerror = () => {};
+        })
       : null;
-    if (detWs) {
-      detWs.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          detectionsRef.current = { people: data.people || [], frameW: data.frame_w || null };
-        } catch {
-          // malformed payload — keep showing the last good overlay
-        }
-        redraw();
-      };
-      detWs.onerror = () => {};
-    }
 
     return () => {
-      ws.close();
-      detWs?.close();
+      disposed = true;
+      timers.forEach(clearTimeout);
+      closeLive();
+      closeDet?.();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [camera?.id, camera?.isConfigured, camera?.feedOn, overlay, width]);

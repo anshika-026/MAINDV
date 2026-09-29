@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // Standalone, keyboard-driven labeling tool for the face-training dataset —
 // deliberately outside AppShell (no sidebar/topbar): this is a fast-repeat
@@ -109,8 +110,8 @@ export default function FaceTraining() {
   // swapped out from under the person mid-type.
   useEffect(() => {
     if (capture) return;
-    const timer = setInterval(loadNext, 30000);
-    return () => clearInterval(timer);
+    const timer = setVisibleInterval(loadNext, 30000);
+    return () => clearVisibleInterval(timer);
   }, [capture, loadNext]);
 
   async function handleLabel(e) {

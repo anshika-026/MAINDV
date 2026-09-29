@@ -5,6 +5,7 @@ import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import DataTable from "../components/DataTable";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // Real unique footfall across every entry gate (backend/app/footfall.py):
 // all gates share one identity gallery, so a person who enters at one gate
@@ -41,10 +42,10 @@ export default function Footfall() {
         })
         .catch(() => !cancelled && setError("Couldn't load footfall — is the backend running?"));
     load();
-    const id = setInterval(load, REFRESH_MS);
+    const id = setVisibleInterval(load, REFRESH_MS);
     return () => {
       cancelled = true;
-      clearInterval(id);
+      clearVisibleInterval(id);
     };
   }, []);
 

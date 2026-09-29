@@ -4,6 +4,7 @@ import PageHeader from "../components/PageHeader";
 import StatCard from "../components/StatCard";
 import ZoneEditor from "../components/ZoneEditor";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // UAT panel for unique footfall: watch each unique person appear as they
 // walk through the gates, and restart the count from zero between test
@@ -75,8 +76,8 @@ export default function FootfallUat() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, REFRESH_MS);
+    return () => clearVisibleInterval(t);
   }, [load]);
 
   async function doReset() {

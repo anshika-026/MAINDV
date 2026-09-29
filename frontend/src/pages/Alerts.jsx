@@ -10,6 +10,7 @@ const resolutionReasons = ["Visitor with permission", "Employee not yet enrolled
 const RANGES = { Today: "today", Yesterday: "yesterday", "This week": "week", "All time": "all" };
 const REFRESH_MS = 15000;
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 const STATUS_OPTIONS = ["Active", "Acknowledged", "Resolved"];
 const SEVERITY_OPTIONS = ["Critical", "High", "Medium", "Low"];
@@ -93,8 +94,8 @@ export default function Alerts() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, REFRESH_MS);
+    return () => clearVisibleInterval(t);
   }, [load]);
 
   // Keep the open panel in sync with refreshed data (e.g. someone else resolved it).

@@ -10,6 +10,7 @@ import Modal from "../components/Modal";
 import Avatar from "../components/Avatar";
 import * as api from "../api/client";
 import DeskZoneEditor from "../components/DeskZoneEditor";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 function hms(seconds) {
   if (!seconds) return "0m";
@@ -90,8 +91,8 @@ export default function Workforce() {
 
   useEffect(() => {
     loadDesks();
-    const t = setInterval(loadDesks, 30000);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(loadDesks, 30000);
+    return () => clearVisibleInterval(t);
   }, [loadDesks]);
 
   const enrollmentSplit = useMemo(

@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Bell, ChevronDown, Calendar, User, ShieldCheck, LogOut } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // Refreshed periodically (not just once) since Topbar stays mounted across
 // every page navigation — the badge should reflect the fleet's current
@@ -37,10 +38,10 @@ export default function Topbar({ title }) {
       });
     }
     refresh();
-    const interval = setInterval(refresh, CAMERA_REFRESH_MS);
+    const interval = setVisibleInterval(refresh, CAMERA_REFRESH_MS);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      clearVisibleInterval(interval);
     };
   }, []);
 

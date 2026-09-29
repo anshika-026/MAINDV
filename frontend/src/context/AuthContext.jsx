@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef } from "react";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 const AuthContext = createContext(null);
 
@@ -96,10 +97,10 @@ export function AuthProvider({ children }) {
         // (clears storage + redirects) — nothing further to do.
       }
     }
-    const interval = setInterval(refresh, CLIENT_SESSION_REFRESH_MS);
+    const interval = setVisibleInterval(refresh, CLIENT_SESSION_REFRESH_MS);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      clearVisibleInterval(interval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-arm when switching between client/non-client, not on every user-field change
   }, [user?.role]);

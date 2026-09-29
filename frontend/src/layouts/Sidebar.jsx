@@ -20,6 +20,7 @@ import { useAuth } from "../context/AuthContext";
 import * as api from "../api/client";
 import Avatar from "../components/Avatar";
 import BrandLogo from "../components/BrandLogo";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // `requiresFeature` gates a nav item for a client login (user.role ===
 // "client", see AuthContext.loginAsClient) to only what their license has
@@ -86,8 +87,8 @@ export default function Sidebar() {
     if (isClient) return;
     const load = () => api.getAlertsSummary().then((s) => setCounts({ alerts: s.active })).catch(() => {});
     load();
-    const t = setInterval(load, 30000);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, 30000);
+    return () => clearVisibleInterval(t);
   }, [isClient]);
 
   // Analytics on/off switches + live CPU (backend/app/analytics_settings.py).
@@ -105,8 +106,8 @@ export default function Sidebar() {
         })
         .catch(() => {});
     load();
-    const t = setInterval(load, 10000);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, 10000);
+    return () => clearVisibleInterval(t);
   }, [isClient]);
 
   async function toggle(e, feature) {

@@ -8,6 +8,7 @@ import Modal from "../components/Modal";
 import SidePanel from "../components/SidePanel";
 import Avatar from "../components/Avatar";
 import * as api from "../api/client";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 // Real attendance, marked from face recognition (backend/app/attendance.py).
 const ALL_COMPANIES = "All companies";
 const statusFilters = ["All statuses", "Present", "On site", "Absent", "On Leave"];
@@ -69,8 +70,8 @@ export default function Attendance() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, REFRESH_MS);
+    return () => clearVisibleInterval(t);
   }, [load]);
 
   useEffect(() => {

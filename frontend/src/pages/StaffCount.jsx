@@ -9,6 +9,7 @@ import StaffEntranceEditor from "../components/StaffEntranceEditor";
 import StaffDebugView from "../components/StaffDebugView";
 import * as api from "../api/client";
 import { useAuth } from "../context/AuthContext";
+import { setVisibleInterval, clearVisibleInterval } from "../lib/visibleInterval";
 
 // Staff Count (backend/app/staff/): who is inside the office right now, from
 // entry/exit line crossings at entrance cameras. The number is the backend's
@@ -56,27 +57,31 @@ export default function StaffCount() {
 
   useEffect(() => {
     load();
-    const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+    const t = setVisibleInterval(load, REFRESH_MS);
+    return () => clearVisibleInterval(t);
   }, [load]);
 
   // Live count over the websocket, falling back to polling.
   useEffect(() => {
     let ws;
     let poll;
+    const startPolling = () => {
+      if (!poll) poll = setVisibleInterval(() => api.getStaffCount().then(setCount).catch(() => {}), 5000);
+    };
     try {
       ws = new WebSocket(api.staffSocketUrl("/ws/staff"));
       ws.onmessage = (e) => setCount(JSON.parse(e.data));
-      ws.onerror = () => {
-        poll = setInterval(() => api.getStaffCount().then(setCount).catch(() => {}), 5000);
-      };
+      // Socket lost (error, server restart, session re-check): keep the
+      // count fresh by polling instead of freezing on the last value.
+      ws.onerror = startPolling;
+      ws.onclose = startPolling;
     } catch {
-      poll = setInterval(() => api.getStaffCount().then(setCount).catch(() => {}), 5000);
+      startPolling();
     }
     api.getStaffCount().then(setCount).catch(() => {});
     return () => {
       ws?.close();
-      clearInterval(poll);
+      clearVisibleInterval(poll);
     };
   }, []);
 
