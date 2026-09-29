@@ -12,20 +12,20 @@ no data behind it comes back as None and the page says so.
 import datetime
 import sqlite3
 import time
-from pathlib import Path
 
 from app import attendance, camera_db, camera_stream, employee_directory
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 # A streaming camera that hasn't delivered a frame for this long is offline.
 OFFLINE_AFTER_SECONDS = 30
 
 
 def _conn():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def _iso(d: datetime.date) -> str:

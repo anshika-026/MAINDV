@@ -1,22 +1,16 @@
 """Camera + site registry, SQLite-backed. Mirrors the shape the frontend's
 api.js already expects (listCameras/createCamera/... and listSites/...)."""
 
-import contextlib
 import sqlite3
-from pathlib import Path
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 
-@contextlib.contextmanager
 def get_connection():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=None)
 
 
 def init_db() -> None:

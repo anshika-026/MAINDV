@@ -28,12 +28,9 @@ VALIDATION_MIN_CLASSES below.
 """
 
 import os
-import shutil
-import time
 from collections import Counter, defaultdict
 from datetime import datetime
 
-import joblib
 import numpy as np
 import threadpoolctl
 from sklearn.linear_model import LogisticRegression
@@ -146,8 +143,8 @@ def _per_class_validation_report(y_val: np.ndarray, y_pred: np.ndarray) -> dict:
             true_label: {str(labels[j]): int(cm[i, j]) for j in range(len(labels)) if cm[i, j] > 0}
             for i, true_label in enumerate(labels)
         },
-        "weak_classes": sorted(l for l, v in per_class.items() if v["weak"]),
-        "insufficient_sample_classes": sorted(l for l, v in per_class.items() if v["insufficient_samples"]),
+        "weak_classes": sorted(label for label, v in per_class.items() if v["weak"]),
+        "insufficient_sample_classes": sorted(label for label, v in per_class.items() if v["insufficient_samples"]),
     }
 
 
@@ -311,19 +308,11 @@ def train_classifier() -> dict:
     final_clf = _fit(usable)
 
     os.makedirs(TRAINING_CAPTURE_DIR, exist_ok=True)
-    backup_path = None
-    if os.path.exists(CLASSIFIER_PATH):
-        backup_path = CLASSIFIER_PATH + f".bak-{int(time.time())}"
-        shutil.copy2(CLASSIFIER_PATH, backup_path)
+    # Atomic save + classifier.meta.json (library versions) + backup
+    # rotation (MODEL_BACKUP_RETENTION_COUNT) — see classifier_io.py.
+    from app import classifier_io
 
-    tmp_path = CLASSIFIER_PATH + ".tmp"
-    try:
-        joblib.dump(final_clf, tmp_path)
-        os.replace(tmp_path, CLASSIFIER_PATH)  # atomic on both POSIX and Windows (NTFS)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
+    backup_path = classifier_io.save(final_clf, CLASSIFIER_PATH)
 
     per_employee_counts = dict(sorted(counts.items()))
     per_employee_training_counts = dict(sorted(capped_counts.items()))

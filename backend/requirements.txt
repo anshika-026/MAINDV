@@ -1,36 +1,66 @@
+# Deco Vision backend — runtime dependencies (Python 3.12).
+#
+# Every package imported by app/ is listed here, pinned to the version the
+# test suite and the live system were verified with (import audit:
+# 2026-09-30). Transitive packages that matter for correctness are pinned
+# too. Do not upgrade ML packages casually: the trained classifier is a
+# scikit-learn pickle (see classifier_io.py) and the tracker relies on
+# supervision's ByteTrack (see below).
+#
+# PyTorch: install the build for your hardware FIRST, then this file:
+#   CPU-only (default, what this project is tested on):
+#     pip install --index-url https://download.pytorch.org/whl/cpu torch==2.13.0 torchvision==0.28.0
+#   NVIDIA GPU: see DEPLOYMENT.md "GPU" (matching CUDA wheel index, plus
+#     onnxruntime-gpu instead of onnxruntime).
+# Plain `pip install -r requirements.txt` without that step pulls the default
+# PyPI torch wheel, which on Linux is the large CUDA build.
+
+# --- Web/API ---------------------------------------------------------------
 fastapi==0.141.1
+starlette==1.3.1
 uvicorn[standard]==0.53.0
-opencv-python==5.0.0.93
 pydantic==2.13.5
+python-multipart==0.0.32
 python-dotenv==1.1.1
 
-# Face recognition (detection + tracking + embedding) — see
-# FACE_RECOGNITION_WIRING.md for the manual bootstrap steps (weight file,
-# gallery enrollment) this alone doesn't cover.
+# --- Imaging / numerics ----------------------------------------------------------
+numpy==2.5.3
+opencv-python==5.0.0.93
+pillow==12.3.0
+PyYAML==6.0.3
+
+# --- Detection, tracking, face recognition -------------------------------------------
+torch==2.13.0
+torchvision==0.28.0
 ultralytics==8.4.151
 insightface==2.0
 onnxruntime==1.30.0
-# onnxruntime-gpu instead, if this ever runs on a box with CUDA available
+# ByteTrack comes from supervision. sv.ByteTrack is deprecated upstream and
+# REMOVED in supervision 0.31 — keep this pin until face_pipeline.py's
+# tracker (_new_tracker) is migrated. See DEPLOYMENT.md "Dependency constraints".
 supervision==0.30.3
-# Provides supervision's ByteTrack — used instead of the `yolox` package,
-# which requires cmake/a C++ toolchain to build and failed on this machine.
 
-# Manual-labeling dataset + classifier training pipeline — see
-# FACE_TRAINING.md. scikit-learn trains a classifier on frozen ArcFace
-# embeddings (Option B); joblib (de)serializes it to/from disk.
-scikit-learn==1.9.1
+# --- Unique footfall (person Re-ID) -------------------------------------------------
+torchreid==0.2.5
+# torchreid imports these at module load but doesn't declare them.
+gdown==6.4.0
+tensorboard==2.21.0
+scipy==1.18.1
+
+# --- Expression (mood) analytics ----------------------------------------------------
+transformers==5.17.0
+huggingface-hub==1.32.0
+safetensors==0.8.0
+
+# --- Face classifier training ---------------------------------------------------------
+# 1.5.2, not newer: pinned to what production classifiers are trained with.
+# classifier_io.py refuses (and logs) a model pickled by a different version
+# that no longer runs, instead of crashing per frame. Retrain after changing this.
+scikit-learn==1.5.2
 joblib==1.6.0
-# CPU-load check for face_training_scheduler.py — lets background auto-retrain
-# defer to the next cycle instead of competing with the live camera pipelines.
+threadpoolctl==3.7.0
 psutil==7.2.2
-# Caps OpenBLAS/OpenMP thread count during classifier fit (face_training.py)
-# so a training run doesn't compete with the live camera pipeline for cores.
-threadpoolctl==3.6.0
 
-# License management — signs/renders the per-license QR code (license_qr.py).
-# JWT here is only used to sign that QR payload, not for user auth/sessions
-# (this app has no real auth system yet — see license_db.py).
+# --- Licensing -----------------------------------------------------------------------
 PyJWT==2.14.0
 qrcode==8.2
-pillow==12.3.0
-python-multipart==0.0.6

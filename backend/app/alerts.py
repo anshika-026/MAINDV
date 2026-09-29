@@ -28,11 +28,12 @@ import threading
 import time
 from pathlib import Path
 from app import lifecycle
+from app import config, db, storage
 
 log = logging.getLogger("alerts")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
-SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "alert_snapshots"
+DB_PATH = config.DB_PATH
+SNAPSHOT_DIR = Path(config.DATA_DIR) / "alert_snapshots"
 
 UNKNOWN_MAX_PROBA = float(os.environ.get("ALERT_UNKNOWN_MAX_PROBA", "0.4"))
 UNKNOWN_COOLDOWN_SECONDS = float(os.environ.get("ALERT_UNKNOWN_COOLDOWN_SECONDS", "300"))
@@ -43,10 +44,9 @@ _lock = threading.Lock()
 
 
 def _conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def init_db() -> None:
@@ -106,7 +106,7 @@ def raise_alert(event: str, severity: str, camera_id: int | None = None, message
             SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
             path = SNAPSHOT_DIR / f"alert_{alert_id}.jpg"
             path.write_bytes(snapshot_jpeg)
-            conn.execute("UPDATE alerts SET snapshot_path = ? WHERE id = ?", (str(path), alert_id))
+            conn.execute("UPDATE alerts SET snapshot_path = ? WHERE id = ?", (storage.to_stored(path), alert_id))
     log.info("alert %s: %s (%s) camera %s %s", alert_id, event, severity, camera_id, message)
     return alert_id
 
@@ -194,8 +194,8 @@ def snapshot_path(alert_id: int) -> Path | None:
         row = conn.execute("SELECT snapshot_path FROM alerts WHERE id = ?", (alert_id,)).fetchone()
     if not row or not row[0]:
         return None
-    p = Path(row[0])
-    return p if p.is_file() else None
+    p = storage.resolve(row[0])
+    return p if p is not None and p.is_file() else None
 
 
 # ---- hooks called from the rest of the backend -----------------------------

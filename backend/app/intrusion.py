@@ -27,7 +27,6 @@ import logging
 import sqlite3
 import threading
 import time
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -35,10 +34,11 @@ import numpy as np
 from app import alerts, analytics_settings, camera_db, resilience
 from app.desk_tracker import in_polygon
 from app import lifecycle
+from app import config, db
 
 log = logging.getLogger("intrusion")
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 CYCLE_SECONDS = 1.0
 PERSON_CONF = 0.45
 EVENT_LOG_SECONDS = 30
@@ -46,9 +46,9 @@ SYNC_INTERVAL_SECONDS = 15
 
 
 def _conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def init_db() -> None:

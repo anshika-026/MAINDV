@@ -92,7 +92,7 @@ def run(url: str, fps: float, stop, seq, meta_q, settings: dict | None = None) -
     def send(msg) -> None:
         try:
             meta_q.put_nowait(msg)
-        except Exception:
+        except Exception:  # noqa: S110
             pass  # parent gone or queue full; nothing useful to do here
 
     def log(text: str) -> None:

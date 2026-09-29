@@ -391,7 +391,7 @@ class CameraStream:
                         continue
                     try:
                         q.put_nowait(data)
-                    except Exception:
+                    except Exception:  # noqa: S110
                         # A full/closed viewer queue drops this frame for
                         # that viewer only (it gets the next one).
                         pass

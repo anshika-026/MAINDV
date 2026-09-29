@@ -1,0 +1,105 @@
+name: CI
+
+# Runs on every push and pull request, and is called by deploy.yml, which
+# refuses to deploy unless this passes for the exact commit being deployed.
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  repo-guard:
+    name: No secrets / personal data in git
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse tracked runtime data, databases, secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -E '^backend/data/|^backend/data_backup|(^|/)\.env$|\.db$|\.db-(wal|shm)$|\.sqlite3?$|\.joblib$|\.pem$|\.key$|\.p12$|\.pfx$' || true)
+          if [ -n "$bad" ]; then
+            echo "These files must not be committed (see GIT_DATA_CLEANUP.md):"
+            echo "$bad" | head -50
+            exit 1
+          fi
+      - name: Refuse obvious hard-coded credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          # rtsp://user:pass@ with a literal password, or private keys.
+          if git grep -nE 'rtsp://[^:/@\s"]+:[^@\s"$]+@|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' -- ':!*.md' ':!**/tests/**'; then
+            echo "Hard-coded credential found"
+            exit 1
+          fi
+
+  backend:
+    name: Backend lint + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      APP_ENV: test
+      MODEL_OFFLINE_MODE: "true"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - name: System libraries for OpenCV
+        run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libgl1 libglib2.0-0
+      - name: Install (CPU torch first, then pinned requirements)
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.13.0 torchvision==0.28.0
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip check
+      - name: Ruff
+        run: ruff check .
+      - name: Tests
+        run: python -m pytest -q -p no:cacheprovider
+      - name: App imports and validates a production config
+        env:
+          APP_ENV: production
+          JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef0123456789
+          CORS_ORIGINS: https://example.invalid
+          DATA_DIR: ${{ runner.temp }}/data
+        run: |
+          python -c "import app.main"
+          python -m app.manage check-config
+
+  frontend:
+    name: Frontend lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - name: Production bundle has no hard-coded API hosts
+        run: |
+          if grep -RqE '127\.0\.0\.1:8821|localhost:8000|13\.61\.58\.14' dist/; then
+            echo "Production build contains a hard-coded development/API address"; exit 1
+          fi
+      - name: Dependency audit (high/critical)
+        run: npm audit --omit=dev --audit-level=high

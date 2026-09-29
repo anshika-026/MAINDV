@@ -26,12 +26,11 @@ decoded while someone is watching it.
 """
 
 import json
-import sqlite3
 import threading
 import time
-from pathlib import Path
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 FEATURES = {
     "face_recognition": "Face recognition & attendance",
@@ -52,8 +51,9 @@ _lock = threading.Lock()
 
 
 def _conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=None)
 
 
 def init_db() -> None:

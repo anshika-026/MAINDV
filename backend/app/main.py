@@ -38,7 +38,7 @@ from . import audit, auth, camera_db, camera_stream, employee_directory, face_co
 from .staff import routes as staff_routes  # noqa: E402
 from .staff.service import service as staff_service  # noqa: E402
 from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes  # noqa: E402
-from . import health_routes, lifecycle, person_detection  # noqa: E402
+from . import health_routes, lifecycle, person_detection, retention  # noqa: E402
 
 log = logging.getLogger("main")
 
@@ -136,9 +136,9 @@ def _enable_wal() -> None:
     "database is locked" on login. WAL lets reads proceed during a write.
     It's a persistent property of the database file, so this is a no-op
     after the first run."""
-    import sqlite3
+    from app import db
 
-    conn = sqlite3.connect(camera_db.DB_PATH, timeout=30)
+    conn = db.open_connection(camera_db.DB_PATH)
     try:
         mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         logging.getLogger("main").info("database journal mode: %s", mode)
@@ -200,6 +200,8 @@ def start_services() -> None:
     intrusion.service.start()
     # Staff Count at entrance cameras (see app/staff/).
     staff_service.start()
+    # Hourly cleanup of expired sessions, old captures/snapshots, backups (retention.py).
+    retention.start()
 
 
 def shutdown() -> None:

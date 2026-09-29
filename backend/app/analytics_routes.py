@@ -7,10 +7,14 @@ analytics_settings.py).
 Mount with: app.include_router(analytics_routes.router) in main.py
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app import analytics_settings, auth
+
+log = logging.getLogger("analytics")
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
@@ -41,5 +45,6 @@ def set_feature(feature: str, payload: SwitchIn, _: dict = Depends(auth.require_
         try:
             sync()
         except Exception:
-            pass
+            # Each service also re-syncs on its own timer; log and carry on.
+            log.exception("analytics switch: immediate resync failed")
     return {"features": analytics_settings.snapshot()}

@@ -8,6 +8,7 @@ manage.py — operator commands, run from backend/:
     python -m app.manage list-admins
     python -m app.manage purge-sessions
     python -m app.manage check-config
+    python -m app.manage retention     # run the data-retention cleanup now
 
 Passwords are read interactively (never from argv, where they'd land in
 shell history and the process list) unless --password-stdin is given, which
@@ -46,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list-admins")
     sub.add_parser("purge-sessions")
     sub.add_parser("check-config")
+    sub.add_parser("retention")
     args = parser.parse_args(argv)
 
     if args.cmd == "check-config":
@@ -72,6 +74,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "list-admins":
             for a in auth.list_admin_users():
                 print(f"{a['email']:40} {'active' if a['is_active'] else 'DISABLED':9} {a['name']}")
+        elif args.cmd == "retention":
+            from app import retention
+
+            for k, v in retention.run_once().items():
+                print(f"{k:20} {v}")
         elif args.cmd == "purge-sessions":
             print(f"Removed {auth.purge_expired_sessions()} expired session(s)")
     except ValueError as e:

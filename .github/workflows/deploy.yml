@@ -1,65 +1,77 @@
-name: Deploy to EC2
+name: Deploy to production
+
+# Deploys ONLY:
+#   - a pushed version tag (v1.2.3), or
+#   - a manual run of this workflow ("Run workflow", choosing the branch/tag
+#     in the "Use workflow from" selector),
+# and only after the full CI suite passes for that exact commit (CI and the
+# deploy both use github.sha, so what was tested is what ships). Pushing to
+# main no longer deploys. The `production` GitHub Environment should be
+# configured with required reviewers (Settings > Environments) so every
+# deploy needs an approval.
+#
+# Required repository/environment configuration:
+#   secrets.EC2_PRIVATE_KEY   SSH key for the deploy user
+#   secrets.EC2_HOST_KEY      the server's SSH host key line(s), as printed by
+#                             `ssh-keyscan -t ed25519 <host>` (pinned: no TOFU)
+#   vars.EC2_HOST             server address
+#   vars.EC2_USER             deploy user (default ubuntu)
+#   vars.APP_DIR              repo checkout on the server (default /home/ubuntu/Deco-vision)
+#   vars.BACKEND_PORT         port the backend's systemd unit listens on (default 8811)
+#   vars.SERVICE_NAME         systemd unit (default deco-vision-backend)
+# The server keeps its own configuration (systemd EnvironmentFile or an
+# untracked backend/.env). Deploys never write it.
 
 on:
   push:
-    branches:
-      - main
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
   group: production-deploy
-  cancel-in-progress: true
+  cancel-in-progress: false   # never interrupt a deploy half way
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    env:
-      EC2_HOST: 56.228.1.6
-      EC2_USER: ubuntu
-      APP_DIR: /home/ubuntu/Deco-vision
+  ci:
+    uses: ./.github/workflows/ci.yml
 
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
+      APP_DIR: ${{ vars.APP_DIR || '/home/ubuntu/Deco-vision' }}
+      BACKEND_PORT: ${{ vars.BACKEND_PORT || '8811' }}
+      SERVICE_NAME: ${{ vars.SERVICE_NAME || 'deco-vision-backend' }}
     steps:
-      - name: Deploy latest main to EC2
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Deploy, verify, roll back on failure
         shell: bash
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+          EC2_HOST_KEY: ${{ secrets.EC2_HOST_KEY }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          test -n "$EC2_HOST" || { echo "vars.EC2_HOST is not set"; exit 1; }
+          test -n "$EC2_HOST_KEY" || { echo "secrets.EC2_HOST_KEY is not set (pin the server host key)"; exit 1; }
 
-          key_file="$RUNNER_TEMP/deco-vision.pem"
+          key_file="$RUNNER_TEMP/deploy.pem"
+          known_hosts="$RUNNER_TEMP/known_hosts"
+          umask 077
           printf '%s\n' "$EC2_PRIVATE_KEY" > "$key_file"
-          chmod 600 "$key_file"
+          printf '%s\n' "$EC2_HOST_KEY" > "$known_hosts"
+          trap 'rm -f "$key_file" "$known_hosts"' EXIT
 
-          ssh_opts=(-i "$key_file" -o BatchMode=yes -o StrictHostKeyChecking=no)
-          remote="${EC2_USER}@${EC2_HOST}"
-
-          ssh "${ssh_opts[@]}" "$remote" bash -s -- "$APP_DIR" <<'REMOTE'
-          set -euo pipefail
-          app_dir="$1"
-
-          cd "$app_dir"
-          git fetch origin main
-          git reset --hard origin/main
-
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libgl1 ffmpeg
-
-          cd "$app_dir/backend"
-          python3 -m venv venv
-          ./venv/bin/pip install --upgrade pip
-          ./venv/bin/pip install -r requirements.txt
-          sudo systemctl restart deco-vision-backend
-
-          cd "$app_dir/frontend"
-          npm ci
-          npm run build
-          sudo chmod o+x /home/ubuntu
-          sudo nginx -t
-          sudo systemctl reload nginx
-
-          curl --fail --silent --show-error http://127.0.0.1:8811/health >/dev/null
-          curl --fail --silent --show-error http://127.0.0.1/ >/dev/null
-          REMOTE
-
-          rm -f "$key_file"
-          echo "Deployment completed successfully."
+          ssh -i "$key_file" -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+            "${EC2_USER}@${EC2_HOST}" \
+            "APP_DIR='$APP_DIR' SHA='$SHA' BACKEND_PORT='$BACKEND_PORT' SERVICE_NAME='$SERVICE_NAME' bash -s" \
+            < scripts/deploy_remote.sh

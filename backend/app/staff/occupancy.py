@@ -24,24 +24,23 @@ import logging
 import sqlite3
 import threading
 import time
-from pathlib import Path
 
 import numpy as np
 
 from app.staff import config as staff_config
+from app import config, db
 
 log = logging.getLogger("staff")
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 PRESENT, EXITED = "PRESENT", "EXITED"
 
 
 def _conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def init_db() -> None:

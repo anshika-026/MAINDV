@@ -13,36 +13,31 @@ diverse, quality-gated reference embeddings per person instead of the single
 low-quality photo enrolled_faces often has today).
 """
 
-import contextlib
 import sqlite3
 import time
 from pathlib import Path
 
 import numpy as np
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 # Unknown-person review photos (spec section 25) — a NEW, separate
 # directory from ENROLLMENT_PHOTOS_DIR (main.py), which backs the
 # UNRELATED existing People/enrolled_faces feature. Not mounted as public
 # StaticFiles like that one — served through an authenticated
 # peopleid_api.py endpoint instead (spec section 34: access-controlled
 # images, not a public URL).
-PHOTOS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "peopleid_photos"
+PHOTOS_DIR = Path(config.DATA_DIR) / "peopleid_photos"
 
 TRACK_STATE_UNKNOWN = "unknown"
 TRACK_STATE_CANDIDATE = "candidate"
 TRACK_STATE_CONFIRMED = "confirmed"
 
 
-@contextlib.contextmanager
 def get_connection():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=None)
 
 
 def init_db() -> None:

@@ -1,0 +1,17 @@
+# Backend lint (CI: `ruff check .` from backend/).
+target-version = "py312"
+line-length = 140
+extend-exclude = ["data", "data_backup*", "models", "logs", "venv", ".venv"]
+
+[lint]
+# Pyflakes + pycodestyle errors, plus bug-prone patterns:
+#   E722 bare `except:`, B bugbear (mutable defaults, loop-variable capture,
+#   except-pass on broad exceptions via S110), S110 try-except-pass.
+select = ["E4", "E7", "E9", "F", "E722", "B006", "B008", "B023", "S110"]
+ignore = [
+    "E402",  # imports after os.environ/threading setup are deliberate (main.py, footfall.py)
+    "B008",  # FastAPI's Depends()/File()/Form() in defaults is the framework idiom
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["S110", "B023"]

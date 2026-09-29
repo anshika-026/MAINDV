@@ -16,16 +16,16 @@ same as any auto-generated label).
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sqlite3
 import time
 from pathlib import Path
 
 import numpy as np
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "app.db"
-SNAPSHOTS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "reid_snapshots"
+DB_PATH = config.DB_PATH
+SNAPSHOTS_DIR = Path(config.DATA_DIR) / "reid_snapshots"
 
 TRACK_STATE_UNKNOWN = "unknown"
 TRACK_STATE_CANDIDATE = "candidate"
@@ -35,15 +35,10 @@ EVENT_NEW_PERSON = "new_person"
 EVENT_SIGHTING = "sighting"
 
 
-@contextlib.contextmanager
 def get_connection():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=None)
 
 
 def init_db() -> None:
@@ -397,10 +392,10 @@ def reset_identities(delete_snapshot_files: bool = True) -> dict[str, int]:
     if delete_snapshot_files:
         with get_connection() as conn:
             paths = [r[0] for r in conn.execute("SELECT file_path FROM reid_snapshots")]
+        from app import storage
+
         for raw in paths:
-            path = Path(raw)
-            if not path.is_absolute():
-                path = SNAPSHOTS_DIR / path.name
+            path = storage.resolve(raw) or SNAPSHOTS_DIR / Path(raw).name
             try:
                 path.unlink(missing_ok=True)
                 files_removed += 1

@@ -158,6 +158,8 @@ IDENTITY_SERVICE_BASE = _str("IDENTITY_SERVICE_BASE").rstrip("/")
 EXTERNAL_HTTP_TIMEOUT = _float("EXTERNAL_HTTP_TIMEOUT", 15.0)
 
 # --- Retention (retention.py) -------------------------------------------------------
+# Master switch for the hourly cleanup (expired sessions are always purged).
+RETENTION_ENABLED = _bool("RETENTION_ENABLED", True)
 RETENTION_INTERVAL_SECONDS = _int("RETENTION_INTERVAL_SECONDS", 3600)
 # Unassigned review-queue captures (face_pending) and their images.
 FACE_PENDING_RETENTION_DAYS = _int("FACE_PENDING_RETENTION_DAYS", 30)

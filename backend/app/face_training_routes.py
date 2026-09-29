@@ -377,11 +377,17 @@ def train():
 
 @router.get("/model-status")
 def model_status():
+    from app import classifier_io
+
     exists = os.path.exists(CLASSIFIER_PATH)
+    meta = classifier_io.read_meta(CLASSIFIER_PATH) if exists else None
     return {
         "classifier_trained": exists,
         "path": CLASSIFIER_PATH if exists else None,
         "trained_at": os.path.getmtime(CLASSIFIER_PATH) if exists else None,
+        "trained_with_sklearn": (meta or {}).get("sklearn"),
+        # Whether the running pipeline could actually use it (see classifier_io).
+        "load_status": classifier_io.last_status,
     }
 
 

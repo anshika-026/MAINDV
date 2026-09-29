@@ -16,26 +16,19 @@ desk_tracker.py decides who is at which desk; this module only records it.
     end, away start / end, desk switch) with the confidence behind it.
 """
 
-import contextlib
 import json
 import sqlite3
 import time
 from datetime import datetime
-from pathlib import Path
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 
-@contextlib.contextmanager
 def get_connection():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def init_db() -> None:

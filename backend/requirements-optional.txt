@@ -1,0 +1,6 @@
+# Optional: only the laptop-webcam "Behavior Analytics" demo page uses
+# TensorFlow (app/behavior_webcam.py, models/emotion_model_v3.keras).
+# Without it that page reports "no emotion"; nothing else is affected.
+# Large (~500 MB). Not needed on camera servers.
+# Not exercised by the test suite on this project; pin chosen to match numpy 2.x.
+tensorflow-cpu==2.21.0

@@ -38,7 +38,7 @@ import numpy as np
 import torchvision.transforms  # noqa: E402,F401
 from torchreid.reid.utils import FeatureExtractor  # noqa: E402,F401
 
-from . import analytics_settings, camera_db, camera_stream, resilience
+from . import analytics_settings, camera_db, camera_stream, resilience, storage
 from .reid import config as reid_config
 from .reid import peopleid_gallery, reid_db, reid_worker
 from app import lifecycle  # noqa: E402
@@ -306,7 +306,7 @@ class FootfallService:
             reid_db.SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
             path = reid_db.SNAPSHOTS_DIR / f"person_{person_id}_{int(now)}.jpg"
             path.write_bytes(best["crop_jpeg"])
-            reid_db.add_snapshot(person_id, camera_id, str(path), best["quality_score"])
+            reid_db.add_snapshot(person_id, camera_id, storage.to_stored(path), best["quality_score"])
         reid_db.log_event(camera_id, track["track_id"], reid_db.EVENT_NEW_PERSON, person_id, track["confidence"], now)
         self._gallery.reload()
         log.info("footfall: new person %s at camera %s", person_id, camera_id)
@@ -362,8 +362,8 @@ class FootfallService:
             row = conn.execute("SELECT file_path FROM reid_snapshots WHERE id = ?", (snapshot_id,)).fetchone()
         if row is None:
             return None
-        path = reid_db.Path(row[0])
-        return path if path.is_file() else None
+        path = storage.resolve(row[0])
+        return path if path is not None and path.is_file() else None
 
     # --- reporting --------------------------------------------------------
 

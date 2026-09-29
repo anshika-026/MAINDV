@@ -76,8 +76,8 @@ def main() -> int:
             people = [{"track_id": int(t), "bbox": [float(v) for v in b]}
                       for t, b in zip(res.boxes.id.cpu().numpy().astype(int), res.boxes.xyxy.cpu().numpy())]
         for ev in tracker.update(people, frame.shape, ts,
-                                 (lambda b: identity.identify(frame, b)) if args.faces else None,
-                                 lambda b: identity.embed(frame, b)):
+                                 (lambda b, frame=frame: identity.identify(frame, b)) if args.faces else None,
+                                 lambda b, frame=frame: identity.embed(frame, b)):
             print(f"  {n / fps:7.1f}s  {ev['event_type']:<16} track {ev['track_id']:<4} "
                   f"{ev['employee_id'] or 'unknown':<8} ({ev['identity_source'] or ''}) {ev['details'] or ''}")
         if args.out:

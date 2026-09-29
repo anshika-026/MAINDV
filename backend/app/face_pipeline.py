@@ -51,6 +51,7 @@ import supervision as sv
 from ultralytics import YOLO
 import insightface
 
+from app import config as _app_config, storage
 from app import alerts
 from app import analytics_settings
 from app import appearance
@@ -72,14 +73,14 @@ log = logging.getLogger("face_pipeline")
 # "backend/data/..." relative default silently doubled up into a
 # backend/backend/data/... tree. Env var overrides still work as absolute
 # paths if you need to point somewhere else entirely.
-_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_DATA_DIR = Path(_app_config.DATA_DIR)
 
 # Stable, version-controllable location for model checkpoints — separate
 # from data/ (runtime state: captures, the DB, the trained classifier).
 # Same cwd-independence reasoning as _DATA_DIR above. The .pt file itself is
 # NOT committed to git or fetched automatically (see FACE_RECOGNITION_WIRING.md)
 # — it's a deliberate, one-time manual step.
-_MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+_MODELS_DIR = Path(_app_config.MODEL_DIR)
 _MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 YOLO_FACE_WEIGHTS = os.environ.get("YOLO_FACE_WEIGHTS", str(_MODELS_DIR / "yolov8n-face.pt"))
@@ -578,13 +579,19 @@ class CameraFacePipeline:
         from disk on every single match (that stat call is cheap; loading
         the pickle is not)."""
         if not os.path.exists(CLASSIFIER_PATH):
+            cls._classifier, cls._classifier_mtime = None, None
             return None
         mtime = os.path.getmtime(CLASSIFIER_PATH)
-        if cls._classifier is None or mtime != cls._classifier_mtime:
+        if mtime != cls._classifier_mtime:
             with cls._model_lock:
-                import joblib
-                cls._classifier = joblib.load(CLASSIFIER_PATH)
-                cls._classifier_mtime = mtime
+                if mtime != cls._classifier_mtime:
+                    # Verified load (classifier_io): a model that can't run
+                    # under this scikit-learn returns None -> gallery-only
+                    # matching, and is not retried until the file changes.
+                    from app import classifier_io
+
+                    cls._classifier = classifier_io.load_verified(CLASSIFIER_PATH)
+                    cls._classifier_mtime = mtime
         return cls._classifier
 
     @staticmethod
@@ -1230,11 +1237,12 @@ class CameraFacePipeline:
                 try:
                     face_db.increment_running_session_duplicates_rejected()
                 except Exception:
-                    pass
+                    log.debug("could not bump duplicate counter", exc_info=True)
                 return
 
             with face_db.capture_limit_lock:
                 if face_db.count_training_captures() >= MAX_TRAINING_CAPTURES:
+                    _warn_capture_cap_reached()
                     return
                 if face_db.count_training_captures_for_camera(self.camera_id) >= MAX_CAPTURES_PER_CAMERA:
                     return
@@ -1273,7 +1281,7 @@ class CameraFacePipeline:
                 face_db.add_training_capture(
                     camera_id=self.camera_id,
                     track_id=state.track_id,
-                    image_path=image_path,
+                    image_path=storage.to_stored(image_path),
                     embedding=embedding.tolist() if embedding is not None else None,
                     detection_confidence=state.best_conf,
                     blur_score=blur,
@@ -1284,12 +1292,14 @@ class CameraFacePipeline:
             try:
                 face_db.touch_running_collection_session()
             except Exception:
-                pass
+                log.debug("could not touch collection session", exc_info=True)
 
             if embedding is not None:
                 self._recent_captures.append((time.time(), embedding))
         except Exception:
-            pass
+            # Never let a failed capture save disturb recognition, but never
+            # hide it either (disk full, permissions, DB locked...).
+            log.exception("camera %s: saving a training capture failed", self.camera_id)
 
     def _recognize_and_route(self, state: TrackState):
         embedding = self._embed(state.best_crop)
@@ -1328,7 +1338,7 @@ class CameraFacePipeline:
         face_db.add_pending(
             camera_id=self.camera_id,
             track_id=state.track_id,
-            image_path=image_path,
+            image_path=storage.to_stored(image_path),
             embedding=embedding.tolist(),
             best_match_person_id=person_id,
             best_match_score=score if person_id else None,
@@ -1349,6 +1359,21 @@ def get_pipeline(camera_id: int) -> CameraFacePipeline:
         if camera_id not in _pipelines:
             _pipelines[camera_id] = CameraFacePipeline(camera_id)
         return _pipelines[camera_id]
+
+
+_cap_warned_at = 0.0
+
+
+def _warn_capture_cap_reached() -> None:
+    """Collection stops at MAX_TRAINING_CAPTURES; say so (hourly), and see
+    retention.py / FACE_CAPTURE_RETENTION_DAYS for how space is reclaimed."""
+    global _cap_warned_at
+    now = time.time()
+    if now - _cap_warned_at > 3600:
+        _cap_warned_at = now
+        log.warning("training capture limit reached (%d); no new training captures are being saved. "
+                    "Label or skip the queue, or let retention remove old unlabeled/rejected captures.",
+                    MAX_TRAINING_CAPTURES)
 
 
 def discard_pipeline(camera_id: int) -> None:

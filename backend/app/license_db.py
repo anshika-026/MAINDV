@@ -22,16 +22,15 @@ this module specifically needs to avoid, unlike e.g. a camera row id.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import re
 import secrets
 import sqlite3
 import time
 import uuid as uuid_lib
-from pathlib import Path
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 STATUS_ACTIVE = "active"
 STATUS_INACTIVE = "inactive"
@@ -99,17 +98,10 @@ _KEY_GROUPS = 4
 _KEY_GROUP_LEN = 4
 
 
-@contextlib.contextmanager
 def get_connection():
-    """Closed on exit — sqlite3's own `with conn:` never closes the
-    connection, which would leak a file descriptor per call."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=None)
 
 
 def init_db() -> None:

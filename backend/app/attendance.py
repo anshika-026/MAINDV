@@ -19,11 +19,11 @@ import os
 import sqlite3
 import threading
 import time
-from pathlib import Path
 
 from app import camera_db, employee_directory
+from app import config, db
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+DB_PATH = config.DB_PATH
 
 # Classifier probability needed for a sighting to count. Measured on
 # held-out data, reads at >= 0.8 were wrong ~0.3% of the time.
@@ -42,10 +42,9 @@ _lock = threading.Lock()
 
 
 def _conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Shared connection policy (app/db.py): lock timeout + busy_timeout,
+    commit on success, rollback on error, and always closed."""
+    return db.connect(DB_PATH, row_factory=sqlite3.Row)
 
 
 def init_db() -> None:

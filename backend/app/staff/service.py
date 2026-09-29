@@ -23,7 +23,6 @@ never delays the video.
 """
 
 import concurrent.futures
-import datetime
 import json
 import logging
 import threading
