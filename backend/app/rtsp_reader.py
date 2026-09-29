@@ -75,6 +75,17 @@ def open_capture(url: str, connect_timeout: float, read_timeout: float):
     return cv2.VideoCapture(url, cv2.CAP_FFMPEG, params)
 
 
+def _parent_alive() -> bool:
+    """False once the backend process that started us is gone. Without this,
+    a backend that crashed or was killed (kill -9, OOM, power loss of the
+    service) left its readers running forever, each holding an RTSP session
+    on the NVR, until the NVR refused new connections for everyone."""
+    import multiprocessing
+
+    parent = multiprocessing.parent_process()
+    return parent is None or parent.is_alive()
+
+
 def run(url: str, fps: float, stop, seq, meta_q, settings: dict | None = None) -> None:
     import cv2
 
@@ -106,14 +117,23 @@ def run(url: str, fps: float, stop, seq, meta_q, settings: dict | None = None) -
         log(f"{reason}; retry {attempt} in {delay:.0f}s")
         deadline = time.monotonic() + delay
         while not stop.is_set():
+            if not _parent_alive():
+                stop.set()
+                return
             left = deadline - time.monotonic()
             if left <= 0:
                 break
             stop.wait(min(HEARTBEAT_SECONDS, left))
             send(("heartbeat",))
 
+    last_parent_check = time.monotonic()
     try:
         while not stop.is_set():
+            now_check = time.monotonic()
+            if now_check - last_parent_check >= 1.0:
+                last_parent_check = now_check
+                if not _parent_alive():
+                    break
             if cap is None:
                 send(("status", "connecting", {"attempt": attempt + 1}))
                 cap = open_capture(url, s["connect_timeout"], s["read_timeout"])

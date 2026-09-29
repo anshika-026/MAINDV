@@ -1,150 +1,86 @@
-# Face Recognition — Deco Vision
+# Deco Vision
 
-Face detection, tracking, and recognition for the 4 live RTSP cameras, plus
-a manual review workflow for training the recognition gallery against
-already-enrolled employee IDs.
+CCTV analytics for offices: live camera viewing plus face recognition and
+attendance, person detection, unique footfall (person Re-ID across gates),
+staff count at entrances, intrusion zones, desk analytics, mood/expression,
+alerts, and a licensed client portal. The backend is FastAPI with SQLite;
+the frontend is React (Vite).
 
-## How this works (read this first)
-
-There is no classifier and no training run. **ArcFace is a frozen,
-pretrained embedding model** — it is never retrained. What actually gets
-"trained" is a lookup table in SQLite: `person_id → many embedding vectors`.
-
-- **Enrollment / labeling** = appending a new vector to a person's bucket.
-- **Recognition** = comparing a new face's vector against every vector in
-  the table (cosine similarity) and taking the closest match.
-
-More labeled photos per person → better matching on future camera frames.
-There is no separate "build the model" step; assigning an ID to a captured
-photo *is* the training action, and it's instant.
-
-## Pipeline
-
-```
-RTSP camera (existing camera_stream.py loop)
-        │
-        ▼
-YOLO-face detection  →  ByteTrack (tracks a face across frames)
-        │
-        ▼
-best frame per track (sharpest/largest — avoids re-processing every frame)
-        │
-        ▼
-InsightFace FaceAnalysis: align + embed (512-dim ArcFace vector)
-        │
-        ▼
-cosine similarity vs. gallery
-        │
-   ┌────┴─────┐
-   ▼          ▼
-match ≥      below
-threshold    threshold
-   │            │
-auto-tagged   → face_pending (waits for manual review)
-```
-
-## Tech stack
-
-| Stage | Library |
+| Document | Contents |
 |---|---|
-| Face detection | YOLOv8-face (fine-tuned weights — **not** generic `yolov8n.pt`) |
-| Tracking | `supervision`'s ByteTrack (pure Python, no native toolchain) |
-| Embedding | InsightFace `buffalo_l` (ArcFace) |
-| Matching | in-memory cosine similarity over embeddings cached from SQLite |
-| Storage | raw `sqlite3`, no ORM — matches existing `camera_db.py` style |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Requirements, configuration, install, models, service, nginx/HTTPS, CI/CD, operations, rollback |
+| [API_DOCUMENTATION.md](API_DOCUMENTATION.md) | Every endpoint and websocket, with its access rule (generated from the code) |
+| [PRODUCTION_READINESS_CHECKLIST.md](PRODUCTION_READINESS_CHECKLIST.md) | What's done, and what still needs a human action before go-live |
+| [PRODUCTION_HARDENING_PLAN.md](PRODUCTION_HARDENING_PLAN.md) | The hardening findings and how each was addressed |
+| [GIT_DATA_CLEANUP.md](GIT_DATA_CLEANUP.md) | Personal data in git history and how to purge it |
+| [backend/FACE_TRAINING.md](backend/FACE_TRAINING.md), [backend/FACE_RECOGNITION_WIRING.md](backend/FACE_RECOGNITION_WIRING.md) | Face recognition pipeline, labeling and classifier training |
+| [PEOPLE_IDENTIFICATION_ARCHITECTURE.md](PEOPLE_IDENTIFICATION_ARCHITECTURE.md), [unique-footfall-export/UNIQUE_FOOTFALL.md](unique-footfall-export/UNIQUE_FOOTFALL.md) | Identity and Re-ID design |
 
-## Files
+## Layout
 
-- `backend/app/face_db.py` — schema + CRUD for the embeddings gallery and
-  the `face_pending` review queue
-- `backend/app/face_pipeline.py` — per-camera worker: detect → track →
-  embed → match/queue. `feed_frame()` is called from the existing
-  `camera_stream.py` read loop — no second connection to the camera.
-- `backend/app/face_routes.py` — FastAPI routes (below)
-- `tools/face_review.html` — standalone local page for manual labeling
-
-## Setup
-
-```bash
-pip install -r backend/requirements.txt
+```
+backend/            FastAPI app (app/), tests/, scripts/, models/ (weights, not in git)
+  app/main.py       app, routes, lifespan (startup/shutdown)
+  app/serve.py      the supported entry point:  python -m app.serve
+  app/config.py     every setting (environment variables; see backend/.env.example)
+frontend/           React + Vite single-page app
+deploy/             systemd unit and nginx site config
+scripts/            deploy_remote.sh (run on the server by the Deploy workflow)
+.github/workflows/  ci.yml (every push/PR) and deploy.yml (tags / manual only)
 ```
 
-Set `YOLO_FACE_WEIGHTS` (env var or `backend/.env`) to a face-specific
-YOLOv8 checkpoint — e.g. from `akanametov/yolo-face` or
-`derronqi/yolov8-face`. **Vet the source yourself before loading it** — it's
-a pickle-based checkpoint, and loading an untrusted one can execute
-arbitrary code. Until this file exists, live camera streaming works
-normally and detection stays silently off.
+## Local development
 
-InsightFace's `buffalo_l` model downloads itself automatically on first run
-(needs internet access once).
-
-## API endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/faces/enroll` | Bootstrap: directly add a known photo for a `person_id` |
-| GET | `/api/faces/pending?hours=24` | List unresolved camera captures |
-| GET | `/api/faces/pending/{id}/image` | Serve a capture's image for review |
-| POST | `/api/faces/assign` | `{pending_id, person_id}` — labels a capture, appends its embedding to that person's gallery |
-| POST | `/api/faces/ignore` | `{pending_id}` — discard a bad/unusable capture |
-| GET | `/api/faces/gallery/{person_id}/count` | How many reference embeddings a person has |
-
-## Step 1 — Bootstrap the gallery
-
-Before cameras have anything to match against, seed the gallery from
-existing enrollment photos (e.g. from the People page / external faces
-service):
+Backend (Python 3.12):
 
 ```bash
-curl -X POST http://127.0.0.1:8821/api/faces/enroll \
-  -F "person_id=018" \
-  -F "photo=@/path/to/photo.jpg"
+cd backend
+python -m venv venv && . venv/bin/activate           # Windows: venv\Scripts\activate
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.13.0 torchvision==0.28.0
+pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env                                  # then edit; APP_ENV=development
+MODEL_OFFLINE_MODE=false python -m scripts.fetch_models   # once: download model weights
+python -m app.manage create-admin --email you@example.com
+python -m app.serve                                   # http://127.0.0.1:8821
 ```
 
-Repeat for every enrolled person's existing photo(s).
+Frontend (Node 22):
 
-## Step 2 — Let cameras run
+```bash
+cd frontend
+cp .env.example .env                                  # VITE_API_BASE_URL=http://127.0.0.1:8821/api
+npm ci
+npm run dev                                           # http://localhost:5180
+```
 
-Once `YOLO_FACE_WEIGHTS` is set and `camera_stream.py` is calling
-`pipeline.feed_frame(frame)`, every camera continuously detects, tracks,
-and embeds faces. Confident matches are silently tagged; anything below
-`MATCH_THRESHOLD` (env var, default `0.45`) lands in `face_pending`.
+Log in with the admin account you created. There is no self-signup. Client
+portal accounts are created by an admin in License Management.
 
-## Step 3 — Manual review / training
+## Checks
 
-Open `tools/face_review.html` in a browser (double-click, or VS Code Live
-Server). It shows one pending capture at a time:
+```bash
+cd backend && ruff check . && python -m pytest -q
+cd frontend && npm run lint && npm run build
+```
 
-- photo, camera, timestamp, and the pipeline's best guess + confidence if
-  it has one
-- type the employee ID → **Enter** → saved via `/api/faces/assign`, next
-  photo appears immediately
-- **Esc** or Skip → `/api/faces/ignore`, moves on
-- polls every 30s to pick up newly-queued captures without a manual refresh
+CI runs the same checks, plus a guard that fails if runtime data, databases
+or secrets are ever committed.
 
-If opening the page from `file://` or a dev server other than the backend
-itself, make sure `CORS_ORIGINS` in `backend/.env` allows that origin (or
-set it to `*` temporarily for local review sessions).
+## Data and privacy
 
-## Tuning
-
-- **`MATCH_THRESHOLD`** — the main lever for false "unknown" results. If
-  correct matches keep landing in the review queue, lower it slightly
-  (e.g. 0.4). If two different people are ever auto-matched to the same
-  ID, raise it.
-- **`FACE_PIPELINE_FPS`** (default 3) — detection sample rate per camera,
-  independent of the stream's actual FPS. Keeps 4 concurrent cameras from
-  overloading the CPU/GPU; 2–5 fps is enough to catch someone walking past.
-- More labeled photos per person = fewer future review-queue hits for
-  them — this compounds the more you review.
+`backend/data/` holds the SQLite database, face captures, enrollment photos,
+training images, Re-ID/alert snapshots and the trained classifier. That's
+biometric personal data. It's git-ignored, never committed, and cleaned up by
+the retention job (DEPLOYMENT.md section 9). Back it up with the procedure in
+DEPLOYMENT.md, not with git.
 
 ## Known issues
 
-- On Windows, `uvicorn --reload` can hang after cameras have been
-  streaming, because blocking `cv2.VideoCapture` reads in a background
-  thread don't respond cleanly to the reloader's restart signal. If the
-  backend seems stuck after an edit while cameras are live, kill and
-  restart manually rather than waiting on it.
-- CP Plus NVR cameras can temporarily lock (401) after repeated failed
-  connection attempts — back off rather than retrying in a loop.
+- Windows Smart App Control can block compiled Python packages
+  (scikit-learn, scipy) with "DLL load failed ... Application Control
+  policy". Retry or reinstall the package. This doesn't affect Linux
+  servers.
+- CP Plus NVRs lock an account after repeated failed logins. The camera
+  reader backs off (2 s up to 60 s) instead of retrying in a loop.
+- Don't use `uvicorn --reload` with cameras streaming. Use
+  `python -m app.serve`.

@@ -1,0 +1,36 @@
+# /etc/systemd/system/deco-vision-backend.service
+# Install:  sudo cp deploy/deco-vision-backend.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now deco-vision-backend
+[Unit]
+Description=Deco Vision backend (FastAPI, camera analytics)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Deco-vision/backend
+# Secrets and site configuration live OUTSIDE the repository (never deployed
+# from git). Template: backend/.env.example. chmod 600, owned by root.
+EnvironmentFile=/etc/deco-vision/backend.env
+# The supported entry point: one worker, bounded graceful shutdown.
+ExecStart=/home/ubuntu/Deco-vision/backend/venv/bin/python -m app.serve
+Restart=always
+RestartSec=5
+# SIGTERM -> lifespan shutdown (streams, RTSP readers, workers). The app
+# drains connections for 10 s then cleans up in a few more; this is the
+# hard ceiling before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+KillMode=mixed
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/deco-vision /var/log/deco-vision /home/ubuntu/Deco-vision/backend
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -62,5 +62,5 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Claude Code session/tooling state — not application source code.
+# Local editor/assistant tooling state — not application source code.
 .claude/

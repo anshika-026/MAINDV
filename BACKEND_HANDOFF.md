@@ -1,6 +1,6 @@
 # Deco Vision — handoff for backend work
 
-Written for whoever (human or Claude session) picks up backend work on this repo next. Everything below reflects the actual state of the code as of this session — verified by reading the source, not by memory.
+Written for whoever picks up backend work on this repo next. Everything below reflects the actual state of the code as of this session — verified by reading the source, not by memory.
 
 ## Tech stack
 
@@ -12,7 +12,7 @@ Written for whoever (human or Claude session) picks up backend work on this repo
 - Dev server fixed to **port 5180** (not the Vite default 5173 — an unrelated project on this machine uses 5173)
 
 **Backend** — `backend/`
-- FastAPI + Uvicorn (`uvicorn app.main:app --reload`), runs on **127.0.0.1:8821**
+- FastAPI, started with `python -m app.serve` (single worker, no reload), on **127.0.0.1:8821** by default. See DEPLOYMENT.md.
 - `opencv-python` (`cv2.VideoCapture`) to pull frames off RTSP cameras
 - SQLite via the stdlib `sqlite3` module — no ORM, no migration tool. Schema is created ad hoc with `CREATE TABLE IF NOT EXISTS` in `camera_db.py`. DB file: `backend/data/app.db`.
 - `python-dotenv` loads `backend/.env` (`HOST`, `PORT`, `CORS_ORIGINS`, `LIVE_STREAM_FPS`)

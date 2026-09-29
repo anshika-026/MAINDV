@@ -214,3 +214,31 @@ def test_a_crashing_reader_is_restarted_with_backoff(stream_env, monkeypatch):
     assert s._thread.is_alive()
     stream_env.stop_all(timeout=10)
     assert _wait(lambda: not _reader_children(), 10)
+
+
+def test_reader_exits_when_its_parent_is_killed(tmp_path):
+    """A backend killed with SIGKILL/TerminateProcess must not leave readers
+    holding NVR sessions forever."""
+    import psutil
+
+    from tests import fake_readers
+
+    pid_file = tmp_path / "reader.pid"
+    middle = multiprocessing.get_context("spawn").Process(target=fake_readers.start_real_reader_then_hang, args=(str(pid_file),))
+    middle.start()
+    assert _wait(lambda: pid_file.exists() and pid_file.read_text().strip(), 30)
+    reader_pid = int(pid_file.read_text())
+    # It must really be running (retrying the unreachable camera) before the
+    # parent dies, or the test would pass vacuously.
+    time.sleep(3)
+    assert psutil.Process(reader_pid).is_running(), "reader did not start"
+    middle.kill()          # abrupt: no cleanup code runs in the parent
+    middle.join(10)
+
+    def gone():
+        try:
+            return not psutil.Process(reader_pid).is_running() or psutil.Process(reader_pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return True
+
+    assert _wait(gone, 20), "orphaned reader kept running after its parent died"

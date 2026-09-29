@@ -106,7 +106,7 @@ INSIGHTFACE_ROOT = _path("INSIGHTFACE_ROOT", Path.home() / ".insightface")
 LIVE_STREAM_FPS = _float("LIVE_STREAM_FPS", 8.0)
 
 # --- RTSP / camera resilience -------------------------------------------------
-RTSP_CONNECT_TIMEOUT = _float("RTSP_CONNECT_TIMEOUT", 10.0)     # seconds to open a stream
+RTSP_CONNECT_TIMEOUT = _float("RTSP_CONNECT_TIMEOUT", 20.0)     # seconds to open a stream (WAN NVRs can be slow)
 RTSP_READ_TIMEOUT = _float("RTSP_READ_TIMEOUT", 10.0)           # seconds a single read may block
 RTSP_RECONNECT_DELAY = _float("RTSP_RECONNECT_DELAY", 2.0)      # first retry delay
 RTSP_RECONNECT_MAX_DELAY = _float("RTSP_RECONNECT_MAX_DELAY", 60.0)  # backoff ceiling

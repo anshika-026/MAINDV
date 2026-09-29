@@ -82,11 +82,9 @@ silently stays off for those streams (see the safety wrapping below) — and
 you can still fully bootstrap the enrollment gallery via `/api/faces/enroll`
 today, since that path doesn't need this file at all.
 
-**Why I didn't fetch it myself this time either**: I looked up and vetted a
-specific candidate (above) via web search rather than guessing, but the
-actual download of the `.pt` file was blocked by Claude Code's own
-auto-mode permission classifier ("Code from External") when I tried it —
-the harness enforces the same caution independently. Download it yourself
+**Downloading it**: a specific candidate was vetted (above) rather than
+guessed. `python -m scripts.fetch_models --check` reports whether it is in
+place and whether its checksum matches the verified weights. Download it yourself
 (browser or `curl -L -o backend/models/yolov8n-face.pt <url>`) and place it
 at the path above; everything else (the stable directory, the
 cwd-independent path resolution, and the verification script) is ready to
