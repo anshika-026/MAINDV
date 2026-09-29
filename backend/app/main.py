@@ -451,6 +451,12 @@ async def ws_detections(websocket: WebSocket, camera_id: int, token: str | None 
                         "name": _employee_display_name(emp_id) if emp_id else None,
                         "color": color,
                         "confidence": det["confidence"],
+                        # Additive fields — every existing consumer of this
+                        # payload keeps working unchanged. Both are null/0
+                        # when the expression model has nothing confident
+                        # for this track, which never affects the name.
+                        "expression": det.get("expression"),
+                        "expression_confidence": det.get("expression_confidence", 0.0),
                     })
             # Boxes are in the camera's full-resolution pixels; the frame
             # size lets a viewer showing a scaled-down picture place them.

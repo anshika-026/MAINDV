@@ -239,7 +239,10 @@ class CameraStream:
                 # Full-HD JPEGs at 8 fps are ~17 Mbps per camera to each
                 # browser (measured); a 960 px grid tile is ~4.4 Mbps and
                 # looks the same at tile size. Nothing is encoded when only
-                # keep-alives (analytics, footfall) are subscribed.
+                # keep-alives (analytics, footfall) are subscribed. Full-size
+                # frames use quality 70 rather than 80: at 1920x1080 the encode
+                # and the ~350 KB/frame were real costs on a CPU-bound box, with
+                # no visible difference on a live view.
                 with self._lock:
                     receivers = [(q, self._widths.get(q)) for q in self._subscribers if q not in self._frameless]
                 encoded: dict = {}
@@ -248,7 +251,7 @@ class CameraStream:
                     key = width if width and width < fw else None
                     if key not in encoded:
                         img = frame if key is None else cv2.resize(frame, (key, round(fh * key / fw)), interpolation=cv2.INTER_AREA)
-                        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80 if key is None else 72])
+                        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70 if key is None else 72])
                         encoded[key] = buf.tobytes() if ok else None
                         if ok and key is None:
                             self.last_jpeg = encoded[key]
