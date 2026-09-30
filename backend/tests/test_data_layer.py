@@ -227,8 +227,18 @@ def test_retention_never_deletes_outside_data_dir(retention_env, tmp_path_factor
     assert outside.exists()
 
 
-def test_orphan_files_are_removed_but_referenced_and_new_files_kept(retention_env):
+def test_orphan_files_are_kept_unless_orphan_deletion_is_enabled(retention_env, monkeypatch):
     retention, root, now = retention_env
+    stray = root / "face_captures" / "restored_by_hand.jpg"
+    stray.write_bytes(b"x")
+    os.utime(stray, (now - 3 * 86400, now - 3 * 86400))
+    assert "orphan_files" not in retention.run_once(now)
+    assert stray.exists()
+
+
+def test_orphan_files_are_removed_but_referenced_and_new_files_kept(retention_env, monkeypatch):
+    retention, root, now = retention_env
+    monkeypatch.setattr(config, "RETENTION_DELETE_ORPHANS", True)
     orphan = root / "face_captures" / "orphan.jpg"
     fresh = root / "face_captures" / "fresh_orphan.jpg"
     orphan.write_bytes(b"x")

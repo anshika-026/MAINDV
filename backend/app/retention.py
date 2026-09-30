@@ -17,7 +17,7 @@ What it removes (each rule disabled by setting its setting to 0):
     ALERT_SNAPSHOT_RETENTION_DAYS ago                         image (alert row kept)
   - classifier backups beyond MODEL_BACKUP_RETENTION_COUNT
   - orphaned image files (no DB row points at them) older than a day, in the
-    capture/snapshot folders only
+    capture/snapshot folders only, and ONLY with RETENTION_DELETE_ORPHANS=true
 
 What it NEVER touches: labeled or skipped training captures (the training
 set), enrollment photos, the active classifier, assigned review captures
@@ -192,8 +192,9 @@ def run_once(now: float | None = None) -> dict:
             ("reid_snapshots", lambda: purge_reid_snapshots(now)),
             ("alert_snapshots", lambda: purge_alert_snapshots(now)),
             ("classifier_backups", purge_classifier_backups),
-            ("orphan_files", lambda: purge_orphans(now)),
         ]
+        if config.RETENTION_DELETE_ORPHANS:
+            rules.append(("orphan_files", lambda: purge_orphans(now)))
     for name, fn in rules:
         try:
             results[name] = fn()

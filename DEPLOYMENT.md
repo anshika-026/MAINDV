@@ -265,7 +265,8 @@ Passwords, tokens and RTSP credentials are redacted.
 
 Labeled and skipped training data, enrollment photos and the active
 classifier are never deleted. `RETENTION_ENABLED=false` turns the cleanup
-off. When the training-capture cap (`MAX_TRAINING_CAPTURES`, 15,000) is
+off. Deleting image files no database row references is opt-in
+(`RETENTION_DELETE_ORPHANS=true`). When the training-capture cap (`MAX_TRAINING_CAPTURES`, 15,000) is
 reached, collection pauses and a warning is logged hourly.
 
 **Backups.** Everything stateful is in `DATA_DIR`. Take a consistent

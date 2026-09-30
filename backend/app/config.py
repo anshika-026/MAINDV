@@ -160,6 +160,9 @@ EXTERNAL_HTTP_TIMEOUT = _float("EXTERNAL_HTTP_TIMEOUT", 15.0)
 # --- Retention (retention.py) -------------------------------------------------------
 # Master switch for the hourly cleanup (expired sessions are always purged).
 RETENTION_ENABLED = _bool("RETENTION_ENABLED", True)
+# Deleting image files no database row points at is opt-in: such files can be
+# data restored or copied in by hand, and deleting them is irreversible.
+RETENTION_DELETE_ORPHANS = _bool("RETENTION_DELETE_ORPHANS", False)
 RETENTION_INTERVAL_SECONDS = _int("RETENTION_INTERVAL_SECONDS", 3600)
 # Unassigned review-queue captures (face_pending) and their images.
 FACE_PENDING_RETENTION_DAYS = _int("FACE_PENDING_RETENTION_DAYS", 30)
