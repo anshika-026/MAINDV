@@ -1,0 +1,7 @@
+# Emotion model training (offline tool; not needed by the backend).
+# Same numpy/OpenCV/scikit-learn versions as backend/requirements.txt.
+tensorflow-cpu==2.21.0
+numpy==2.5.3
+opencv-python==5.0.0.93
+scikit-learn==1.5.2
+matplotlib==3.11.1

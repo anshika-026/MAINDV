@@ -15,6 +15,7 @@ the frontend is React (Vite).
 | [PRODUCTION_HARDENING_PLAN.md](PRODUCTION_HARDENING_PLAN.md) | The hardening findings and how each was addressed |
 | [GIT_DATA_CLEANUP.md](GIT_DATA_CLEANUP.md) | Personal data in git history and how to purge it |
 | [backend/FACE_TRAINING.md](backend/FACE_TRAINING.md), [backend/FACE_RECOGNITION_WIRING.md](backend/FACE_RECOGNITION_WIRING.md) | Face recognition pipeline, labeling and classifier training |
+| [training/emotion/README.md](training/emotion/README.md) | Training, evaluating and deploying the mood (emotion) model |
 | [PEOPLE_IDENTIFICATION_ARCHITECTURE.md](PEOPLE_IDENTIFICATION_ARCHITECTURE.md), [unique-footfall-export/UNIQUE_FOOTFALL.md](unique-footfall-export/UNIQUE_FOOTFALL.md) | Identity and Re-ID design |
 
 ## Layout
@@ -26,6 +27,7 @@ backend/            FastAPI app (app/), tests/, scripts/, models/ (weights, not 
   app/config.py     every setting (environment variables; see backend/.env.example)
 frontend/           React + Vite single-page app
 deploy/             systemd unit and nginx site config
+training/emotion/   offline training/evaluation of the mood (emotion) model
 scripts/            deploy_remote.sh (run on the server by the Deploy workflow)
 .github/workflows/  ci.yml (every push/PR) and deploy.yml (tags / manual only)
 ```

@@ -75,7 +75,9 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
           python -m pip check
       - name: Ruff
-        run: ruff check .
+        run: |
+          ruff check .
+          ruff check ../training --config ruff.toml
       - name: Tests
         run: python -m pytest -q -p no:cacheprovider
       - name: App imports and validates a production config

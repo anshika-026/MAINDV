@@ -1,0 +1,4 @@
+# Training data (face images of people) and trained outputs: never committed.
+dataset/
+output/
+.venv/

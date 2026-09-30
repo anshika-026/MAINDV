@@ -92,6 +92,13 @@ git filter-repo --force \
   --path-glob '*.joblib.bak-*' \
   --invert-paths
 
+# In the same rewrite: strip AI-assistant attribution trailers from commit
+# messages (six commits on main end with "Co-Authored-By: Claude ...").
+git filter-repo --force --message-callback '
+import re
+return re.sub(rb"\n*Co-Authored-By: Claude[^\n]*", b"", message).rstrip() + b"\n"
+'
+
 # Optional: also drop large model binaries from history.
 # git filter-repo --force --path-glob 'models/*.pt' --path-glob '*.pth' --path-glob '*.onnx' --invert-paths
 
