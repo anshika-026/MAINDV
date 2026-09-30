@@ -34,8 +34,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # rtsp://user:pass@ with a literal password, or private keys.
-          if git grep -nE 'rtsp://[^:/@\s"]+:[^@\s"$]+@|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' -- ':!*.md' ':!**/tests/**'; then
+          # An rtsp:// URL carrying a literal password, or a private key.
+          #
+          # The scheme is written [r]tsp:// so that this line does not match
+          # its own pattern. Spelled plainly, the search found the search
+          # itself -- "[^" satisfies the username class, ":" the separator,
+          # "/" the password class -- and since this file is not excluded
+          # from the scan, the step failed on every run whatever the repo
+          # contained. [r] matches a literal "r", so real URLs are still
+          # caught; the text on this line simply no longer is.
+          if git grep -nE '[r]tsp://[^:/@\s"]+:[^@\s"$]+@|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' -- ':!*.md' ':!**/tests/**'; then
             echo "Hard-coded credential found"
             exit 1
           fi
