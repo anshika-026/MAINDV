@@ -133,10 +133,27 @@ MODEL_OFFLINE_MODE=false ./venv/bin/python -m scripts.fetch_models   # downloads
 | `buffalo_l/` | `INSIGHTFACE_ROOT/models/` (default `~/.insightface`) | face alignment + ArcFace embeddings |
 | facial-expression model | Hugging Face cache (`HF_HOME`) | mood / expression (optional) |
 | `emotion_model_v3.keras` | `MODEL_DIR` (tracked in git) | webcam demo (optional) |
+| `yolo26s.pt`, `imc_general_best.pt`, `office_fixtures.pt` | `MODEL_DIR` | object detection (optional; `fetch_models` copies them from the `object-detection` branch) |
 
 A missing required model makes `/ready` return 503 and names it. The
 feature that needs it logs a clear error and keeps retrying, and the other
 features keep running.
+
+### Object detection
+
+Detects backpacks, handbags, bottles and laptops on analytics cameras
+(`backend/app/object_detection/`). It's **off by default**. Turn it on with
+the switch next to **Object Detection** in the sidebar (admin). It costs
+about 0.6 s of CPU per camera look.
+
+- One worker thread serves all cameras, each at `OBJECT_DETECTION_FPS` looks
+  per second (default 0.2, one look every 5 s), so it can use at most one core.
+- Clients see it only if their license includes **Object Detection**, and
+  only for their own cameras.
+- The module's zero-shot fallback models (YOLO-World, RT-DETR, CLIP) would
+  download weights at runtime, so they're off. `OBJECT_DETECTION_FALLBACK=true`
+  enables them only when `MODEL_OFFLINE_MODE=false`, and then also needs
+  `pip install ensemble-boxes`.
 
 ## 5. Database and first admin
 

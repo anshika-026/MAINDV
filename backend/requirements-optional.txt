@@ -4,3 +4,7 @@
 # Large (~500 MB). Not needed on camera servers.
 # Not exercised by the test suite on this project; pin chosen to match numpy 2.x.
 tensorflow-cpu==2.21.0
+
+# Only for OBJECT_DETECTION_FALLBACK=true (weighted box fusion of the
+# zero-shot fallback models, app/object_detection/detector.py).
+ensemble-boxes==1.0.9

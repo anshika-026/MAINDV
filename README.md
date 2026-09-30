@@ -3,7 +3,8 @@
 CCTV analytics for offices: live camera viewing plus face recognition and
 attendance, person detection, unique footfall (person Re-ID across gates),
 staff count at entrances, intrusion zones, desk analytics, mood/expression,
-alerts, and a licensed client portal. The backend is FastAPI with SQLite;
+alerts, object detection (backpack, handbag, bottle, laptop), and a licensed
+client portal. The backend is FastAPI with SQLite;
 the frontend is React (Vite).
 
 | Document | Contents |

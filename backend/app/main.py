@@ -39,6 +39,8 @@ from .staff import routes as staff_routes  # noqa: E402
 from .staff.service import service as staff_service  # noqa: E402
 from . import alerts, alerts_routes, analytics_routes, analytics_settings, intrusion, intrusion_routes, attendance, attendance_routes, desk_db, desk_routes, desks, face_routes, insights_routes, face_training_routes, footfall, footfall_routes, license_routes  # noqa: E402
 from . import health_routes, lifecycle, person_detection, retention  # noqa: E402
+from .object_detection import routes as object_detection_routes  # noqa: E402
+from .object_detection.service import service as object_detection_service  # noqa: E402
 
 log = logging.getLogger("main")
 
@@ -126,6 +128,7 @@ app.include_router(analytics_routes.router)
 app.include_router(intrusion_routes.router)
 app.include_router(staff_routes.router)
 app.include_router(health_routes.router)
+app.include_router(object_detection_routes.router)
 staff_routes.register_websockets(app)
 
 
@@ -202,6 +205,8 @@ def start_services() -> None:
     staff_service.start()
     # Hourly cleanup of expired sessions, old captures/snapshots, backups (retention.py).
     retention.start()
+    # Object detection worker (idle until its analytics switch is on).
+    object_detection_service.start()
 
 
 def shutdown() -> None:

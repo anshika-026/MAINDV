@@ -733,6 +733,22 @@ curl -s https://vision.example.com/api/cameras -H "Authorization: Bearer $TOKEN"
 - **Status codes:** 200, 401, 403, 422
 
 
+## Object detection
+
+#### `GET /api/objects/latest`
+
+- **Access:** Admin, or client with the licensed feature (limited to their cameras)
+- **Description:** Newest detection result per camera (backpack, handbag, bottle, laptop). A result older than a few detection intervals is flagged `stale`.
+- **Parameters:** `authorization` (header)
+- **Status codes:** 200, 401, 403, 422
+
+#### `GET /api/objects/status`
+
+- **Access:** Admin
+- **Parameters:** `authorization` (header)
+- **Status codes:** 200, 401, 403, 422
+
+
 ## Alerts
 
 #### `GET /api/alerts`

@@ -32,6 +32,7 @@ GROUPS = [
     ("Footfall", ("/api/footfall",)),
     ("Staff count", ("/api/staff",)),
     ("Intrusion", ("/api/intrusion",)),
+    ("Object detection", ("/api/objects",)),
     ("Alerts", ("/api/alerts",)),
     ("Analytics switches and settings", ("/api/analytics", "/api/settings", "/api/stats")),
     ("Audit log", ("/api/audit",)),

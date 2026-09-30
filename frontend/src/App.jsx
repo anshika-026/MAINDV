@@ -22,6 +22,7 @@ const Footfall = lazy(() => import("./pages/Footfall"));
 const StaffCount = lazy(() => import("./pages/StaffCount"));
 const FootfallUat = lazy(() => import("./pages/FootfallUat"));
 const Intrusion = lazy(() => import("./pages/Intrusion"));
+const ObjectDetection = lazy(() => import("./pages/ObjectDetection"));
 const CameraManagement = lazy(() => import("./pages/CameraManagement"));
 const SiteManagement = lazy(() => import("./pages/SiteManagement"));
 const LicenseManagement = lazy(() => import("./pages/LicenseManagement"));
@@ -90,6 +91,7 @@ export default function App() {
             <Route path="/footfall" element={<Page><Footfall /></Page>} />
             <Route path="/footfall-uat" element={<AdminRoute><Page><FootfallUat /></Page></AdminRoute>} />
             <Route path="/intrusion" element={<Page><Intrusion /></Page>} />
+            <Route path="/objects" element={<Page><ObjectDetection /></Page>} />
             <Route path="/cameras" element={<AdminRoute><Page><CameraManagement /></Page></AdminRoute>} />
             <Route path="/sites" element={<AdminRoute><Page><SiteManagement /></Page></AdminRoute>} />
             <Route path="/licenses" element={<AdminRoute><Page><LicenseManagement /></Page></AdminRoute>} />

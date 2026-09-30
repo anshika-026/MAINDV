@@ -19,6 +19,9 @@ survives a restart.
                     appearance learned from today's face matches (appearance.py).
   live_overlay      the person boxes drawn on the AI Analytics view: an extra
                     person-detection pass per watched camera (face_pipeline.py).
+  object_detection  backpack/handbag/bottle/laptop detection on analytics
+                    cameras (object_detection/). OFF by default: it costs
+                    about 0.6 s of CPU per look.
 
 Cameras are also only kept streaming in the background while an analytics
 feature that needs them is on, so with everything off a camera is only
@@ -42,11 +45,14 @@ FEATURES = {
     "alerts": "Alerts",
     "expression": "Expression detection",
     "appearance_handoff": "Name by appearance",
+    "object_detection": "Object detection",
 }
+# Switches that start OFF on a fresh install (until switched on and saved).
+DEFAULT_OFF = {"object_detection"}
 # Expression reads the face crops of the live person boxes, so it needs them on.
 DEPENDS_ON = {"desk_analytics": "face_recognition", "expression": "live_overlay", "appearance_handoff": "face_recognition"}
 
-_state = {k: True for k in FEATURES}
+_state = {k: k not in DEFAULT_OFF for k in FEATURES}
 _lock = threading.Lock()
 
 

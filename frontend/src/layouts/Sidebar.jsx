@@ -12,6 +12,7 @@ import {
   FlaskConical,
   Users,
   ShieldX,
+  Package,
   Cctv,
   MapPinned,
   IdCard,
@@ -55,6 +56,7 @@ const NAV_SECTIONS = [
       { to: "/footfall", label: "Footfall", icon: Footprints, requiresFeature: "footfall_analytics", analytics: "footfall" },
       { to: "/footfall-uat", label: "Footfall UAT", icon: FlaskConical, requiresFeature: "footfall_analytics", adminOnly: true, analytics: "footfall" },
       { to: "/intrusion", label: "Intrusion", icon: ShieldX, requiresFeature: "intrusion_detection", analytics: "intrusion" },
+      { to: "/objects", label: "Object Detection", icon: Package, requiresFeature: "object_detection", analytics: "object_detection" },
     ],
   },
   {

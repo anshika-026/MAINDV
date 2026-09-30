@@ -82,6 +82,19 @@ def fetch(spec: models.ModelSpec) -> None:
         if spec.path.stat().st_size < fetch_reid_model.MIN_BYTES:
             spec.path.unlink()
             raise RuntimeError("Re-ID download truncated")
+    elif spec.source.startswith("git: "):
+        # Weights published on a branch of this repository (e.g. the
+        # object-detection branch's models/). Needs a clone with that ref.
+        import subprocess
+
+        ref_path = spec.source[len("git: "):]
+        spec.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(spec.path, "wb") as f:
+            done = subprocess.run(["git", "show", ref_path], stdout=f, stderr=subprocess.PIPE)
+        if done.returncode != 0:
+            spec.path.unlink(missing_ok=True)
+            raise RuntimeError(f"git show {ref_path} failed: {done.stderr.decode(errors='replace').strip()} "
+                               f"(run `git fetch origin object-detection` first)")
     elif spec.key == "expression_hf":
         from huggingface_hub import snapshot_download
 

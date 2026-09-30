@@ -612,6 +612,12 @@ export async function getIntrusionStats() {
   return request("/intrusion/stats");
 }
 
+// ---- Object detection (backend/app/object_detection/) ----------------------
+// Latest backpack/handbag/bottle/laptop detections per camera.
+export async function getObjectDetections() {
+  return request("/objects/latest");
+}
+
 // ---- Staff Count (backend/app/staff/) -------------------------------------
 // Occupancy from entry/exit line crossings at entrance cameras; the count is
 // the backend's occupancy state, never the number of people in a frame.

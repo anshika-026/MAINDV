@@ -61,6 +61,7 @@ action outside the code (listed under "Before go-live").
 - [x] API tests (authorization, settings, health)
 - [x] Tenant isolation tests
 - [x] Live end-to-end run against real cameras (startup, login, RTSP, camera failure and recovery, shutdown, restart)
+- [x] Object detection: service + API tests; live run on 4 cameras, offline, no stdout output, 4 target classes only
 
 ## Before go-live (human actions)
 1. Decide on and perform the git history purge (GIT_DATA_CLEANUP.md), and treat the data as exposed if the repo was ever public.

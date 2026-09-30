@@ -29,6 +29,7 @@ import numpy as np
 
 from . import analytics_settings, camera_db, config, footfall, intrusion, person_detection, resilience, rtsp_reader  # noqa: F401 (footfall/intrusion register as consumers on import)
 from .face_pipeline import discard_pipeline, get_pipeline
+from .object_detection.service import service as object_detection_service
 from .staff import service as _staff_service  # noqa: F401 (registers with person_detection on import)
 
 log = logging.getLogger("camera_stream")
@@ -365,6 +366,15 @@ class CameraStream:
                     person_detection.service.feed(self.camera_id, frame)
                 except Exception:
                     log.exception("camera %s: person detection dispatch failed", self.camera_id)
+
+                # Object detection (backpack/handbag/bottle/laptop): keeps only
+                # the newest frame when this camera is due; its own worker
+                # does the inference (object_detection/service.py).
+                if analytics:
+                    try:
+                        object_detection_service.feed(self.camera_id, frame)
+                    except Exception:
+                        log.exception("camera %s: object detection dispatch failed", self.camera_id)
 
                 # JPEG-encode once per distinct width actually being watched.
                 # Full-HD JPEGs at 8 fps are ~17 Mbps per camera to each
