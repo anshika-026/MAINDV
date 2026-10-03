@@ -1,0 +1,81 @@
+name: Deploy to devwise server
+
+# Continuous deployment to the devwise server (144.79.198.94, http://144.79.198.94).
+#
+# Runs automatically when the CI workflow finishes successfully for a push to
+# main, and deploys exactly the commit CI tested. A failed or cancelled CI run
+# never deploys. Can also be started by hand from the Actions tab.
+#
+# This is separate from deploy.yml (EC2, tag-based), which it does not affect.
+#
+# The SSH key's forced command on the server (~/deco-deploy/deploy.sh) takes
+# only the commit SHA and runs that commit's scripts/deploy_remote.sh: checkout,
+# dependencies, model check, frontend build, backend restart, /health + /ready
+# check, and rollback to the previous commit on failure.
+#
+# Required secret:
+#   secrets.DEVWISE_DEPLOY_KEY  private SSH key whose public half is in
+#                               devwise's authorized_keys with that forced
+#                               command (it can only deploy, nothing else).
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: devwise-deploy
+  cancel-in-progress: false   # never interrupt a deploy half way
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: devwise
+      url: http://144.79.198.94
+    env:
+      HOST: 144.79.198.94
+      USER_NAME: devwise
+      # Pinned server host key (public, from `ssh-keyscan -t ed25519`).
+      HOST_KEY: "144.79.198.94 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICQLrRXv1CHIyncuETN2UrYrnY3zPmT61JDBN+MHC0zO"
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Deploy ${{ env.SHA }}
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.DEVWISE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" || { echo "secrets.DEVWISE_DEPLOY_KEY is not set"; exit 1; }
+          umask 077
+          key_file="$RUNNER_TEMP/deploy_key"
+          known_hosts="$RUNNER_TEMP/known_hosts"
+          printf '%s\n' "$DEPLOY_KEY" > "$key_file"
+          printf '%s\n' "$HOST_KEY" > "$known_hosts"
+          trap 'rm -f "$key_file" "$known_hosts"' EXIT
+          # The key's forced command runs deploy.sh; the only argument is the SHA.
+          ssh -i "$key_file" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+            -o ServerAliveInterval=30 -o ConnectTimeout=20 \
+            "${USER_NAME}@${HOST}" "$SHA"
+
+      - name: Check the live site
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 http://144.79.198.94/ || true)
+            [ "$code" = 200 ] && { echo "http://144.79.198.94 is up (200)"; exit 0; }
+            sleep 5
+          done
+          echo "http://144.79.198.94 returned $code"; exit 1

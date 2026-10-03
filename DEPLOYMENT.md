@@ -233,6 +233,15 @@ the session token).
   | `production` | environment | add required reviewers |
 
 - **Release:** `git tag v1.0.0 && git push origin v1.0.0`, then approve.
+- **`.github/workflows/deploy-devwise.yml`** deploys **every push to `main`**
+  to the devwise server (`144.79.198.94`, served at `http://144.79.198.94`)
+  once CI passes for that commit. The `DEVWISE_DEPLOY_KEY` secret is an SSH
+  key. In `devwise`'s `authorized_keys` it is limited to one forced command,
+  `~/deco-deploy/deploy.sh <sha>`, which runs that commit's
+  `scripts/deploy_remote.sh` and logs to `~/deco-deploy/deploy.log`. The
+  server layout matches sections 2 to 7, except that the user is `devwise`,
+  the repo is at `/home/devwise/Deco-vision`, and nginx serves plain HTTP on
+  the IP because there is no domain yet.
 - `scripts/deploy_remote.sh` runs on the server. It records the current
   commit, untracks old runtime files so git can't delete them, backs up the
   `.env` files, checks out the exact commit, installs and checks
