@@ -56,6 +56,7 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/client-login" element={<ClientLogin />} />
+          <Route path="/client" element={<Navigate to="/client-login" replace />} />
           {/* Dev-mode equivalent of client-<slug>.decovision.com — see
               backend/app/license_routes.py's public_company_by_slug and
               the report's production-deployment notes for real subdomains. */}
